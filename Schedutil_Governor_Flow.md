@@ -798,6 +798,304 @@ watch -n 0.1 "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
 
 ---
 
+## 11. CPPC 调频流程
+
+### 11.1 CPPC 概述
+
+**CPPC (Collaborative Processor Performance Control)** 是 ACPI 规范定义的 CPU 性能控制接口，主要用于 ARM64 服务器和部分 x86 平台。CPPC 调频 **完全复用 schedutil 的框架**，只是在驱动层有不同的实现。
+
+### 11.2 CPPC 与 Schedutil 的关系
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CPPC 调频完整流程                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                          与其他驱动完全相同
+                               │
+    ┌──────────────────────────┼──────────────────────────┐
+    │                          │                          │
+    │        调度器层           │                          │
+    │    cpufreq_update_util() │                          │
+    │             │            │                          │
+    │             ▼            │                          │
+    │      Schedutil Governor  │   ← 相同的 Governor      │
+    │  sugov_update_single_*() │                          │
+    │             │            │                          │
+    │             ▼            │                          │
+    │     get_next_freq()      │   ← 相同的频率计算       │
+    │             │            │                          │
+    └─────────────┼────────────┘                          │
+                  │                                        │
+    ┌─────────────┼────────────┐                          │
+    │             ▼            │                          │
+    │      CPUFreq Core        │                          │
+    │  cpufreq_driver_fast_    │                          │
+    │       switch()           │                          │
+    │             │            │                          │
+    └─────────────┼────────────┘                          │
+                  │                                        │
+    ╔═════════════╪════════════╗                          │
+    ║             ▼            ║   ← CPPC 特有部分        │
+    ║    CPPC Driver 层        ║                          │
+    ║  cppc_cpufreq_fast_      ║                          │
+    ║       switch()           ║                          │
+    ║             │            ║                          │
+    ║             ▼            ║                          │
+    ║      cppc_set_perf()     ║   ← ACPI CPPC 接口      │
+    ║             │            ║                          │
+    ║             ▼            ║                          │
+    ║    写入 CPPC 寄存器       ║   ← 系统内存/PCC        │
+    ╚══════════════════════════╝                          │
+                                                          │
+```
+
+### 11.3 CPPC Driver 关键接口
+
+```c
+/* drivers/cpufreq/cppc_cpufreq.c */
+
+static struct cpufreq_driver cppc_cpufreq_driver = {
+    .flags      = CPUFREQ_CONST_LOOPS | CPUFREQ_NEED_UPDATE_LIMITS,
+    .verify     = cppc_verify_policy,
+    .target     = cppc_cpufreq_set_target,      /* Slow Path */
+    .get        = cppc_cpufreq_get_rate,
+    .fast_switch = cppc_cpufreq_fast_switch,    /* Fast Path */
+    .init       = cppc_cpufreq_cpu_init,
+    .exit       = cppc_cpufreq_cpu_exit,
+    .set_boost  = cppc_cpufreq_set_boost,
+    .name       = "cppc_cpufreq",
+};
+```
+
+### 11.4 Fast Switch 条件
+
+CPPC 是否支持 fast_switch 取决于 **DESIRED_PERF 寄存器的位置**：
+
+```c
+/* drivers/acpi/cppc_acpi.c */
+bool cppc_allow_fast_switch(void)
+{
+    struct cpc_register_resource *desired_reg;
+    struct cpc_desc *cpc_ptr;
+    int cpu;
+
+    for_each_online_cpu(cpu) {
+        cpc_ptr = per_cpu(cpc_desc_ptr, cpu);
+        desired_reg = &cpc_ptr->cpc_regs[DESIRED_PERF];
+        
+        /* 只有寄存器在系统内存或系统 I/O 时才支持 fast_switch */
+        if (!CPC_IN_SYSTEM_MEMORY(desired_reg) &&
+            !CPC_IN_SYSTEM_IO(desired_reg))
+            return false;
+    }
+    return true;
+}
+```
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CPPC 寄存器位置与路径选择                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   DESIRED_PERF 寄存器位置          →        调频路径                    │
+│   ─────────────────────────────────────────────────────────             │
+│   System Memory (MMIO)             →        Fast Path ✓                 │
+│   System I/O (Port I/O)            →        Fast Path ✓                 │
+│   PCC (Platform Communication      →        Slow Path ✗                 │
+│        Channel)                             (需要固件交互)              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.5 CPPC Fast Path 实现
+
+```c
+/* drivers/cpufreq/cppc_cpufreq.c */
+static unsigned int cppc_cpufreq_fast_switch(struct cpufreq_policy *policy,
+                                              unsigned int target_freq)
+{
+    struct cppc_cpudata *cpu_data = policy->driver_data;
+    unsigned int cpu = policy->cpu;
+    u32 desired_perf;
+    int ret;
+
+    /* 1. 频率转换为 CPPC 性能级别 */
+    desired_perf = cppc_khz_to_perf(&cpu_data->perf_caps, target_freq);
+    cpu_data->perf_ctrls.desired_perf = desired_perf;
+    
+    /* 2. 调用 ACPI CPPC 接口设置性能 */
+    ret = cppc_set_perf(cpu, &cpu_data->perf_ctrls);
+
+    if (ret) {
+        pr_debug("Failed to set target on CPU:%d. ret:%d\n", cpu, ret);
+        return 0;
+    }
+    return target_freq;
+}
+```
+
+### 11.6 CPPC Slow Path 实现
+
+```c
+/* drivers/cpufreq/cppc_cpufreq.c */
+static int cppc_cpufreq_set_target(struct cpufreq_policy *policy,
+                                    unsigned int target_freq,
+                                    unsigned int relation)
+{
+    struct cppc_cpudata *cpu_data = policy->driver_data;
+    unsigned int cpu = policy->cpu;
+    struct cpufreq_freqs freqs;
+    int ret = 0;
+
+    /* 1. 频率转换为性能级别 */
+    cpu_data->perf_ctrls.desired_perf =
+        cppc_khz_to_perf(&cpu_data->perf_caps, target_freq);
+    
+    freqs.old = policy->cur;
+    freqs.new = target_freq;
+
+    /* 2. 频率转换通知 (开始) */
+    cpufreq_freq_transition_begin(policy, &freqs);
+    
+    /* 3. 调用 ACPI CPPC 接口 */
+    ret = cppc_set_perf(cpu, &cpu_data->perf_ctrls);
+    
+    /* 4. 频率转换通知 (结束) */
+    cpufreq_freq_transition_end(policy, &freqs, ret != 0);
+
+    return ret;
+}
+```
+
+### 11.7 cppc_set_perf() 底层实现
+
+```c
+/* drivers/acpi/cppc_acpi.c */
+int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
+{
+    struct cpc_desc *cpc_desc = per_cpu(cpc_desc_ptr, cpu);
+    struct cpc_register_resource *desired_reg, *min_perf_reg, *max_perf_reg;
+    
+    /* 获取 CPPC 寄存器描述 */
+    desired_reg = &cpc_desc->cpc_regs[DESIRED_PERF];
+    min_perf_reg = &cpc_desc->cpc_regs[MIN_PERF];
+    max_perf_reg = &cpc_desc->cpc_regs[MAX_PERF];
+
+    /* 如果寄存器在 PCC 中，需要获取锁 */
+    if (CPC_IN_PCC(desired_reg) || CPC_IN_PCC(min_perf_reg) || 
+        CPC_IN_PCC(max_perf_reg)) {
+        down_read(&pcc_ss_data->pcc_lock);  /* Phase-I */
+        /* ... 检查 PCC 通道归属 ... */
+    }
+
+    /* 写入性能寄存器 */
+    cpc_write(cpu, desired_reg, perf_ctrls->desired_perf);
+    if (perf_ctrls->min_perf)
+        cpc_write(cpu, min_perf_reg, perf_ctrls->min_perf);
+    if (perf_ctrls->max_perf)
+        cpc_write(cpu, max_perf_reg, perf_ctrls->max_perf);
+
+    /* 如果在 PCC 中，需要 doorbell 通知平台 */
+    if (CPC_IN_PCC(desired_reg)) {
+        /* Phase-II: 批量发送 PCC 命令 */
+        send_pcc_cmd(pcc_ss_id, CMD_WRITE);
+    }
+    
+    return ret;
+}
+```
+
+### 11.8 CPPC 调频完整调用链
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              CPPC Fast Path 完整调用链                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+[调度器上下文]
+update_load_avg() / enqueue_task_fair() / ...
+    └── cpufreq_update_util(rq, flags)
+            └── sugov_update_single_freq()           ← Schedutil
+                    ├── sugov_get_util()
+                    │       └── effective_cpu_util()
+                    ├── get_next_freq()
+                    │       └── map_util_freq()
+                    └── cpufreq_driver_fast_switch()  ← CPUFreq Core
+                            └── cppc_cpufreq_fast_switch()  ← CPPC Driver
+                                    ├── cppc_khz_to_perf()  # 频率→性能转换
+                                    └── cppc_set_perf()     ← ACPI CPPC
+                                            └── cpc_write() # 写入寄存器
+                                                    └── [MMIO/PIO 写操作]
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│              CPPC Slow Path (PCC) 完整调用链                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+[调度器上下文]
+cpufreq_update_util()
+    └── sugov_update_single_freq()
+            └── sugov_deferred_update()
+                    └── irq_work_queue()
+
+[IRQ 上下文]
+sugov_irq_work()
+    └── kthread_queue_work()
+
+[Kthread 上下文]
+sugov_work()
+    └── __cpufreq_driver_target()
+            └── cppc_cpufreq_set_target()           ← CPPC Driver
+                    ├── cppc_khz_to_perf()
+                    ├── cpufreq_freq_transition_begin()
+                    ├── cppc_set_perf()              ← ACPI CPPC
+                    │       ├── down_read(&pcc_lock)  # PCC Phase-I
+                    │       ├── cpc_write()           # 写入 PCC 缓冲区
+                    │       ├── up_read(&pcc_lock)
+                    │       ├── down_write(&pcc_lock) # PCC Phase-II  
+                    │       ├── send_pcc_cmd(CMD_WRITE) # 发送 Doorbell
+                    │       └── up_write(&pcc_lock)
+                    └── cpufreq_freq_transition_end()
+```
+
+### 11.9 CPPC vs 其他驱动对比
+
+| 特性 | CPPC | Intel P-State | ACPI CPUFreq |
+|------|------|---------------|--------------|
+| **标准** | ACPI CPPC | Intel HWP | ACPI P-States |
+| **平台** | ARM64/x86 | Intel | x86 (AMD/Intel) |
+| **fast_switch** | 条件支持 | 支持 | 支持 |
+| **性能表示** | 性能级别 | 性能百分比 | 频率 |
+| **硬件接口** | 系统内存/PCC | MSR | MSR/MMIO |
+| **固件交互** | 可能 (PCC) | 无 | 无 |
+
+### 11.10 调试 CPPC
+
+```bash
+# 检查 CPPC 驱动是否加载
+lsmod | grep cppc
+
+# 查看 CPPC 相关的 sysfs
+ls /sys/devices/system/cpu/cpu0/cpufreq/
+
+# 查看 CPPC 特有属性
+cat /sys/devices/system/cpu/cpu0/cpufreq/freqdomain_cpus
+cat /sys/devices/system/cpu/cpu0/cpufreq/auto_select
+cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference_val
+
+# 检查 fast_switch 是否启用
+cat /sys/devices/system/cpu/cpufreq/policy0/fast_switch_enabled
+
+# 查看 ACPI CPPC 信息
+cat /sys/firmware/acpi/tables/CPPC  # 如果存在
+
+# 内核日志
+dmesg | grep -i cppc
+```
+
+---
+
 ## 附录：调用链总结
 
 ### Fast Path 完整调用链
