@@ -68,12 +68,12 @@
  * timeout value used in Stratix10 FPGA manager driver.
  * timeout value used in RSU driver
  */
-#define SVC_RECONFIG_REQUEST_TIMEOUT_MS         300
-#define SVC_RECONFIG_BUFFER_TIMEOUT_MS          720
-#define SVC_RSU_REQUEST_TIMEOUT_MS              300
+#define SVC_RECONFIG_REQUEST_TIMEOUT_MS         5000
+#define SVC_RECONFIG_BUFFER_TIMEOUT_MS          5000
+#define SVC_RSU_REQUEST_TIMEOUT_MS              2000
 #define SVC_FCS_REQUEST_TIMEOUT_MS		2000
 #define SVC_COMPLETED_TIMEOUT_MS		30000
-#define SVC_HWMON_REQUEST_TIMEOUT_MS		300
+#define SVC_HWMON_REQUEST_TIMEOUT_MS		2000
 
 struct stratix10_svc_chan;
 
@@ -154,6 +154,10 @@ struct stratix10_svc_chan;
  *
  * @COMMAND_HWMON_READVOLT: query the voltage from the hardware monitor,
  * return status is SVC_STATUS_OK or SVC_STATUS_ERROR
+ *
+ * @COMMAND_SMC_ATF_BUILD_VER: Non-mailbox SMC ATF Build Version,
+ * return status is SVC_STATUS_OK
+ *
  */
 enum stratix10_svc_command_code {
 	/* for FPGA */
@@ -187,7 +191,8 @@ enum stratix10_svc_command_code {
 	COMMAND_SMC_SVC_VERSION = 200,
 	/* for HWMON */
 	COMMAND_HWMON_READTEMP,
-	COMMAND_HWMON_READVOLT
+	COMMAND_HWMON_READVOLT,
+	COMMAND_SMC_ATF_BUILD_VER
 };
 
 /**

@@ -31,6 +31,9 @@
 #define SOCK_RECONF_CTR			10
 #define USLEEP_MAX			10000
 
+#define MAX_SKB_FRAGS_PATH "/proc/sys/net/core/max_skb_frags"
+#define SMP_CACHE_BYTES_PATH "/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size"
+
 extern bool opt_verbose;
 #define print_verbose(x...) do { if (opt_verbose) ksft_print_msg(x); } while (0)
 
@@ -43,6 +46,24 @@ static inline u32 ceil_u32(u32 a, u32 b)
 static inline u64 ceil_u64(u64 a, u64 b)
 {
 	return (a + b - 1) / b;
+}
+
+static inline unsigned int read_procfs_val(const char *path)
+{
+	unsigned int read_val = 0;
+	FILE *file;
+
+	file = fopen(path, "r");
+	if (!file) {
+		ksft_print_msg("Error opening %s\n", path);
+		return 0;
+	}
+
+	if (fscanf(file, "%u", &read_val) != 1)
+		ksft_print_msg("Error reading %s\n", path);
+
+	fclose(file);
+	return read_val;
 }
 
 /* Simple test */
@@ -62,6 +83,7 @@ typedef int (*test_func_t)(struct test_spec *test);
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
+	struct xsk_umem_info *umem_real;
 	struct xsk_umem_info *umem;
 	struct xsk_socket *xsk;
 	struct pkt_stream *pkt_stream;
@@ -81,6 +103,7 @@ struct xsk_umem_info {
 	struct xsk_ring_cons cq;
 	struct xsk_umem *umem;
 	u64 next_buffer;
+	u64 mmap_size;
 	u32 num_frames;
 	u32 frame_headroom;
 	void *buffer;
@@ -102,7 +125,6 @@ struct ifobject {
 	char ifname[MAX_INTERFACE_NAME_CHARS];
 	struct xsk_socket_info *xsk;
 	struct xsk_socket_info *xsk_arr;
-	struct xsk_umem_info *umem;
 	thread_func_t func_ptr;
 	validation_func_t validation_func;
 	struct xsk_xdp_progs *xdp_progs;
@@ -115,6 +137,8 @@ struct ifobject {
 	int mtu;
 	u32 bind_flags;
 	u32 xdp_zc_max_segs;
+	u32 umem_tailroom;
+	u32 max_skb_frags;
 	bool tx_on;
 	bool rx_on;
 	bool use_poll;
@@ -183,6 +207,8 @@ struct test_spec {
 	bool set_ring;
 	bool adjust_tail;
 	bool adjust_tail_support;
+	bool poll_tmout;
+	bool use_barrier;
 	enum test_mode mode;
 	char name[MAX_TEST_NAME_SIZE];
 };

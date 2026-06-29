@@ -378,7 +378,7 @@ xfs_attr_log_item(
 	 * structure with fields from this xfs_attr_intent
 	 */
 	attrp = &attrip->attri_format;
-	attrp->alfi_ino = args->dp->i_ino;
+	attrp->alfi_ino = I_INO(args->dp);
 	ASSERT(!(attr->xattri_op_flags & ~XFS_ATTRI_OP_FLAGS_TYPE_MASK));
 	attrp->alfi_op_flags = attr->xattri_op_flags;
 	attrp->alfi_value_len = nv->value.iov_len;
@@ -653,7 +653,6 @@ xfs_attri_recover_work(
 		break;
 	}
 	if (error) {
-		xfs_irele(ip);
 		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp, attrp,
 				sizeof(*attrp));
 		return ERR_PTR(-EFSCORRUPTED);
@@ -696,7 +695,7 @@ xfs_attri_recover_work(
 	args->attr_filter = attrp->alfi_attr_filter & XFS_ATTRI_FILTER_MASK;
 	args->op_flags = XFS_DA_OP_RECOVERY | XFS_DA_OP_OKNOENT |
 			 XFS_DA_OP_LOGGED;
-	args->owner = args->dp->i_ino;
+	args->owner = I_INO(args->dp);
 	xfs_attr_sethash(args);
 
 	switch (xfs_attr_intent_op(attr)) {
@@ -1047,8 +1046,8 @@ xlog_recover_attri_commit_pass2(
 		break;
 	case XFS_ATTRI_OP_FLAGS_SET:
 	case XFS_ATTRI_OP_FLAGS_REPLACE:
-		/* Log item, attr name, attr value */
-		if (item->ri_total != 3) {
+		/* Log item, attr name, optional attr value */
+		if (item->ri_total != 2 + !!attri_formatp->alfi_value_len) {
 			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
 					     attri_formatp, len);
 			return -EFSCORRUPTED;
@@ -1130,52 +1129,6 @@ xlog_recover_attri_commit_pass2(
 		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
 				attri_formatp, len);
 		return -EFSCORRUPTED;
-	}
-
-	switch (op) {
-	case XFS_ATTRI_OP_FLAGS_REMOVE:
-		/* Regular remove operations operate only on names. */
-		if (attr_value != NULL || value_len != 0) {
-			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
-					     attri_formatp, len);
-			return -EFSCORRUPTED;
-		}
-		fallthrough;
-	case XFS_ATTRI_OP_FLAGS_PPTR_REMOVE:
-	case XFS_ATTRI_OP_FLAGS_PPTR_SET:
-	case XFS_ATTRI_OP_FLAGS_SET:
-	case XFS_ATTRI_OP_FLAGS_REPLACE:
-		/*
-		 * Regular xattr set/remove/replace operations require a name
-		 * and do not take a newname.  Values are optional for set and
-		 * replace.
-		 *
-		 * Name-value set/remove operations must have a name, do not
-		 * take a newname, and can take a value.
-		 */
-		if (attr_name == NULL || name_len == 0) {
-			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
-					     attri_formatp, len);
-			return -EFSCORRUPTED;
-		}
-		break;
-	case XFS_ATTRI_OP_FLAGS_PPTR_REPLACE:
-		/*
-		 * Name-value replace operations require the caller to
-		 * specify the old and new names and values explicitly.
-		 * Values are optional.
-		 */
-		if (attr_name == NULL || name_len == 0) {
-			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
-					     attri_formatp, len);
-			return -EFSCORRUPTED;
-		}
-		if (attr_new_name == NULL || new_name_len == 0) {
-			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
-					     attri_formatp, len);
-			return -EFSCORRUPTED;
-		}
-		break;
 	}
 
 	/*

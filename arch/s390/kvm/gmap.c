@@ -105,6 +105,11 @@ static void gmap_add_child(struct gmap *parent, struct gmap *child)
 	else
 		clear_bit(GMAP_FLAG_ALLOW_HPAGE_1M, &child->flags);
 
+	if (test_bit(GMAP_FLAG_ALLOW_HPAGE_2G, &parent->flags))
+		set_bit(GMAP_FLAG_ALLOW_HPAGE_2G, &child->flags);
+	else
+		clear_bit(GMAP_FLAG_ALLOW_HPAGE_2G, &child->flags);
+
 	if (kvm_is_ucontrol(parent->kvm))
 		clear_bit(GMAP_FLAG_OWNS_PAGETABLES, &child->flags);
 	list_add(&child->list, &parent->children);
@@ -125,7 +130,7 @@ struct gmap *gmap_new_child(struct gmap *parent, gfn_t limit)
 
 int gmap_set_limit(struct gmap *gmap, gfn_t limit)
 {
-	struct kvm_s390_mmu_cache *mc;
+	struct kvm_s390_mmu_cache *mc __free(kvm_s390_mmu_cache) = NULL;
 	int rc, type;
 
 	type = gmap_limit_to_type(limit);
@@ -142,7 +147,6 @@ int gmap_set_limit(struct gmap *gmap, gfn_t limit)
 			rc = dat_set_asce_limit(mc, &gmap->asce, type);
 	} while (rc == -ENOMEM);
 
-	kvm_s390_free_mmu_cache(mc);
 	return 0;
 }
 
@@ -181,6 +185,7 @@ void gmap_remove_child(struct gmap *child)
 
 	list_del(&child->list);
 	child->parent = NULL;
+	child->invalidated = true;
 }
 
 /**
@@ -313,23 +318,26 @@ static long gmap_clear_young_crste(union crste *crstep, gfn_t gfn, gfn_t end, st
 	struct clear_young_pte_priv *priv = walk->priv;
 	union crste crste, new;
 
-	crste = READ_ONCE(*crstep);
+	do {
+		crste = READ_ONCE(*crstep);
 
-	if (!crste.h.fc)
-		return 0;
-	if (!crste.s.fc1.y && crste.h.i)
-		return 0;
-	if (!crste_prefix(crste) || gmap_mkold_prefix(priv->gmap, gfn, end)) {
+		if (!crste.h.fc)
+			return 0;
+		if (!crste.s.fc1.y && crste.h.i)
+			return 0;
+		if (crste_prefix(crste) && !gmap_mkold_prefix(priv->gmap, gfn, end))
+			break;
+
 		new = crste;
 		new.h.i = 1;
 		new.s.fc1.y = 0;
 		new.s.fc1.prefix_notif = 0;
-		if (new.s.fc1.d || !new.h.p)
+		if ((new.s.fc1.d || !new.h.p) && !new.s.fc1.s)
 			folio_set_dirty(phys_to_folio(crste_origin_large(crste)));
 		new.s.fc1.d = 0;
 		new.h.p = 1;
-		dat_crstep_xchg(crstep, new, gfn, walk->asce);
-	}
+	} while (!dat_crstep_xchg_atomic(crstep, crste, new, gfn, walk->asce));
+
 	priv->young = 1;
 	return 0;
 }
@@ -391,14 +399,31 @@ static long _gmap_unmap_crste(union crste *crstep, gfn_t gfn, gfn_t next, struct
 {
 	struct gmap_unmap_priv *priv = walk->priv;
 	struct folio *folio = NULL;
+	union crste old = *crstep;
+	bool ok;
 
-	if (crstep->h.fc) {
-		if (crstep->s.fc1.pr && test_bit(GMAP_FLAG_EXPORT_ON_UNMAP, &priv->gmap->flags))
-			folio = phys_to_folio(crste_origin_large(*crstep));
-		gmap_crstep_xchg(priv->gmap, crstep, _CRSTE_EMPTY(crstep->h.tt), gfn);
-		if (folio)
-			uv_convert_from_secure_folio(folio);
+	if (!old.h.fc)
+		return 0;
+
+	if (old.s.fc1.pr && test_bit(GMAP_FLAG_EXPORT_ON_UNMAP, &priv->gmap->flags))
+		folio = phys_to_folio(crste_origin_large(old));
+	/*
+	 * No races should happen because kvm->mmu_lock is held in write mode,
+	 * but the unmap operation could have triggered an unshadow, which
+	 * causes gmap_crstep_xchg_atomic() to return false and clear the
+	 * vsie_notif bit. Allow the operation to fail once, if the old crste
+	 * had the vsie_notif bit set. A second failure is not allowed, for
+	 * the reasons above.
+	 */
+	ok = gmap_crstep_xchg_atomic(priv->gmap, crstep, old, _CRSTE_EMPTY(old.h.tt), gfn);
+	if (!ok) {
+		KVM_BUG_ON(!old.s.fc1.vsie_notif, priv->gmap->kvm);
+		old.s.fc1.vsie_notif = 0;
+		ok = gmap_crstep_xchg_atomic(priv->gmap, crstep, old, _CRSTE_EMPTY(old.h.tt), gfn);
+		KVM_BUG_ON(!ok, priv->gmap->kvm);
 	}
+	if (folio)
+		uv_convert_from_secure_folio(folio);
 
 	return 0;
 }
@@ -474,23 +499,24 @@ static long _crste_test_and_clear_softdirty(union crste *table, gfn_t gfn, gfn_t
 
 	if (fatal_signal_pending(current))
 		return 1;
-	crste = READ_ONCE(*table);
-	if (!crste.h.fc)
-		return 0;
-	if (crste.h.p && !crste.s.fc1.sd)
-		return 0;
+	do {
+		crste = READ_ONCE(*table);
+		if (!crste.h.fc)
+			return 0;
+		if (crste.h.p && !crste.s.fc1.sd)
+			return 0;
 
-	/*
-	 * If this large page contains one or more prefixes of vCPUs that are
-	 * currently running, do not reset the protection, leave it marked as
-	 * dirty.
-	 */
-	if (!crste.s.fc1.prefix_notif || gmap_mkold_prefix(gmap, gfn, end)) {
+		/*
+		 * If this large page contains one or more prefixes of vCPUs that are
+		 * currently running, do not reset the protection, leave it marked as
+		 * dirty.
+		 */
+		if (crste.s.fc1.prefix_notif && !gmap_mkold_prefix(gmap, gfn, end))
+			break;
 		new = crste;
 		new.h.p = 1;
 		new.s.fc1.sd = 0;
-		gmap_crstep_xchg(gmap, table, new, gfn);
-	}
+	} while (!gmap_crstep_xchg_atomic(gmap, table, crste, new, gfn));
 
 	for ( ; gfn < end; gfn++)
 		mark_page_dirty(gmap->kvm, gfn);
@@ -511,7 +537,7 @@ void gmap_sync_dirty_log(struct gmap *gmap, gfn_t start, gfn_t end)
 	_dat_walk_gfn_range(start, end, gmap->asce, &walk_ops, 0, gmap);
 }
 
-static int gmap_handle_minor_crste_fault(union asce asce, struct guest_fault *f)
+static int gmap_handle_minor_crste_fault(struct gmap *gmap, struct guest_fault *f)
 {
 	union crste newcrste, oldcrste = READ_ONCE(*f->crstep);
 
@@ -522,6 +548,7 @@ static int gmap_handle_minor_crste_fault(union asce asce, struct guest_fault *f)
 	f->pfn = PHYS_PFN(large_crste_to_phys(oldcrste, f->gfn));
 	f->writable = oldcrste.s.fc1.w;
 
+	f->crste_region3 = is_pud(oldcrste);
 	/* Appropriate permissions already (race with another handler), nothing to do. */
 	if (!oldcrste.h.i && !(f->write_attempt && oldcrste.h.p))
 		return 0;
@@ -536,10 +563,8 @@ static int gmap_handle_minor_crste_fault(union asce asce, struct guest_fault *f)
 			newcrste.s.fc1.d = 1;
 			newcrste.s.fc1.sd = 1;
 		}
-		if (!oldcrste.s.fc1.d && newcrste.s.fc1.d)
-			SetPageDirty(phys_to_page(crste_origin_large(newcrste)));
 		/* In case of races, let the slow path deal with it. */
-		return !dat_crstep_xchg_atomic(f->crstep, oldcrste, newcrste, f->gfn, asce);
+		return !gmap_crstep_xchg_atomic(gmap, f->crstep, oldcrste, newcrste, f->gfn);
 	}
 	/* Trying to write on a read-only page, let the slow path deal with it. */
 	return 1;
@@ -568,8 +593,6 @@ static int _gmap_handle_minor_pte_fault(struct gmap *gmap, union pgste *pgste,
 		newpte.s.d = 1;
 		newpte.s.sd = 1;
 	}
-	if (!oldpte.s.d && newpte.s.d)
-		SetPageDirty(pfn_to_page(newpte.h.pfra));
 	*pgste = gmap_ptep_xchg(gmap, f->ptep, newpte, *pgste, f->gfn);
 
 	return 0;
@@ -606,48 +629,135 @@ int gmap_try_fixup_minor(struct gmap *gmap, struct guest_fault *fault)
 			fault->callback(fault);
 		pgste_set_unlock(fault->ptep, pgste);
 	} else {
-		rc = gmap_handle_minor_crste_fault(gmap->asce, fault);
+		rc = gmap_handle_minor_crste_fault(gmap, fault);
 		if (!rc && fault->callback)
 			fault->callback(fault);
 	}
 	return rc;
 }
 
-static inline bool gmap_2g_allowed(struct gmap *gmap, gfn_t gfn)
+/**
+ * gmap_2g_allowed() - Check whether a 2G hugepage is allowed.
+ * @gmap: The gmap of the guest.
+ * @f: Describes the fault that is being resolved.
+ * @slot: The memslot the faulting address belongs to.
+ *
+ * The function checks whether the GMAP_FLAG_ALLOW_HPAGE_2G flag is set for
+ * @gmap, whether the offset of the address in the 2G virtual frame is the
+ * same as the offset in the physical 2G frame, and finally whether the whole
+ * 2G page would fit in the given memslot.
+ *
+ * Return: true if a 2G hugepage is allowed to back the faulting address, false
+ *         otherwise.
+ */
+static inline bool gmap_2g_allowed(struct gmap *gmap, struct guest_fault *f,
+				   struct kvm_memory_slot *slot)
 {
-	return false;
+	return test_bit(GMAP_FLAG_ALLOW_HPAGE_2G, &gmap->flags) &&
+	       !((f->gfn ^ f->pfn) & ~_REGION3_FR_MASK) &&
+	       slot->base_gfn <= ALIGN_DOWN(f->gfn, _PAGES_PER_REGION3) &&
+	       slot->base_gfn + slot->npages >= ALIGN(f->gfn + 1, _PAGES_PER_REGION3);
 }
 
-static inline bool gmap_1m_allowed(struct gmap *gmap, gfn_t gfn)
+/**
+ * gmap_1m_allowed() - Check whether a 1M hugepage is allowed.
+ * @gmap: The gmap of the guest.
+ * @f: Describes the fault that is being resolved.
+ * @slot: The memslot the faulting address belongs to.
+ *
+ * The function checks whether the GMAP_FLAG_ALLOW_HPAGE_1M flag is set for
+ * @gmap, whether the offset of the address in the 1M virtual frame is the
+ * same as the offset in the physical 1M frame, and finally whether the whole
+ * 1M page would fit in the given memslot.
+ *
+ * Return: true if a 1M hugepage is allowed to back the faulting address, false
+ *         otherwise.
+ */
+static inline bool gmap_1m_allowed(struct gmap *gmap, struct guest_fault *f,
+				   struct kvm_memory_slot *slot)
 {
-	return test_bit(GMAP_FLAG_ALLOW_HPAGE_1M, &gmap->flags);
+	return test_bit(GMAP_FLAG_ALLOW_HPAGE_1M, &gmap->flags) &&
+	       !((f->gfn ^ f->pfn) & ~_SEGMENT_FR_MASK) &&
+	       slot->base_gfn <= ALIGN_DOWN(f->gfn, _PAGES_PER_SEGMENT) &&
+	       slot->base_gfn + slot->npages >= ALIGN(f->gfn + 1, _PAGES_PER_SEGMENT);
 }
 
-int gmap_link(struct kvm_s390_mmu_cache *mc, struct gmap *gmap, struct guest_fault *f)
+static int _gmap_link(struct kvm_s390_mmu_cache *mc, struct gmap *gmap, int level,
+		      struct guest_fault *f)
+{
+	union crste oldval, newval;
+	union pte newpte, oldpte;
+	union pgste pgste;
+	int rc = 0;
+
+	rc = dat_entry_walk(mc, f->gfn, gmap->asce, DAT_WALK_ALLOC_CONTINUE, level,
+			    &f->crstep, &f->ptep);
+	if (rc == -ENOMEM)
+		return rc;
+	if (KVM_BUG_ON(rc == -EINVAL, gmap->kvm))
+		return rc;
+	if (rc)
+		return -EAGAIN;
+	if (KVM_BUG_ON(get_level(f->crstep, f->ptep) > level, gmap->kvm))
+		return -EINVAL;
+
+	if (f->ptep) {
+		pgste = pgste_get_lock(f->ptep);
+		oldpte = *f->ptep;
+		newpte = _pte(f->pfn, f->writable, f->write_attempt | oldpte.s.d, !f->page);
+		newpte.s.sd = oldpte.s.sd;
+		oldpte.s.sd = 0;
+		if (oldpte.val == _PTE_EMPTY.val || oldpte.h.pfra == f->pfn) {
+			pgste = gmap_ptep_xchg(gmap, f->ptep, newpte, pgste, f->gfn);
+			if (f->callback)
+				f->callback(f);
+		} else {
+			rc = -EAGAIN;
+		}
+		pgste_set_unlock(f->ptep, pgste);
+	} else {
+		do {
+			oldval = READ_ONCE(*f->crstep);
+			newval = _crste_fc1(f->pfn, oldval.h.tt, f->writable,
+					    f->write_attempt | oldval.s.fc1.d);
+			newval.s.fc1.s = !f->page;
+			newval.s.fc1.sd = oldval.s.fc1.sd;
+			if (oldval.val != _CRSTE_EMPTY(oldval.h.tt).val &&
+			    crste_origin_large(oldval) != crste_origin_large(newval))
+				return -EAGAIN;
+			f->crste_region3 = is_pud(newval);
+		} while (!gmap_crstep_xchg_atomic(gmap, f->crstep, oldval, newval, f->gfn));
+		if (f->callback)
+			f->callback(f);
+	}
+
+	return rc;
+}
+
+int gmap_link(struct kvm_s390_mmu_cache *mc, struct gmap *gmap, struct guest_fault *f,
+	      struct kvm_memory_slot *slot)
 {
 	unsigned int order;
-	int rc, level;
+	int level;
 
 	lockdep_assert_held(&gmap->kvm->mmu_lock);
 
 	level = TABLE_TYPE_PAGE_TABLE;
 	if (f->page) {
 		order = folio_order(page_folio(f->page));
-		if (order >= get_order(_REGION3_SIZE) && gmap_2g_allowed(gmap, f->gfn))
+		if (order >= get_order(_REGION3_SIZE) && gmap_2g_allowed(gmap, f, slot))
 			level = TABLE_TYPE_REGION3;
-		else if (order >= get_order(_SEGMENT_SIZE) && gmap_1m_allowed(gmap, f->gfn))
+		else if (order >= get_order(_SEGMENT_SIZE) && gmap_1m_allowed(gmap, f, slot))
 			level = TABLE_TYPE_SEGMENT;
 	}
-	rc = dat_link(mc, gmap->asce, level, uses_skeys(gmap), f);
-	KVM_BUG_ON(rc == -EINVAL, gmap->kvm);
-	return rc;
+	return _gmap_link(mc, gmap, level, f);
 }
 
 static int gmap_ucas_map_one(struct kvm_s390_mmu_cache *mc, struct gmap *gmap,
 			     gfn_t p_gfn, gfn_t c_gfn, bool force_alloc)
 {
+	union crste newcrste, oldcrste;
 	struct page_table *pt;
-	union crste newcrste;
 	union crste *crstep;
 	union pte *ptep;
 	int rc;
@@ -673,7 +783,11 @@ static int gmap_ucas_map_one(struct kvm_s390_mmu_cache *mc, struct gmap *gmap,
 			    &crstep, &ptep);
 	if (rc)
 		return rc;
-	dat_crstep_xchg(crstep, newcrste, c_gfn, gmap->asce);
+	do {
+		oldcrste = READ_ONCE(*crstep);
+		if (oldcrste.val == newcrste.val)
+			break;
+	} while (!dat_crstep_xchg_atomic(crstep, oldcrste, newcrste, c_gfn, gmap->asce));
 	return 0;
 }
 
@@ -744,8 +858,8 @@ int gmap_ucas_translate(struct kvm_s390_mmu_cache *mc, struct gmap *gmap, gpa_t 
 
 int gmap_ucas_map(struct gmap *gmap, gfn_t p_gfn, gfn_t c_gfn, unsigned long count)
 {
-	struct kvm_s390_mmu_cache *mc;
-	int rc;
+	struct kvm_s390_mmu_cache *mc __free(kvm_s390_mmu_cache) = NULL;
+	int rc = 0;
 
 	mc = kvm_s390_new_mmu_cache();
 	if (!mc)
@@ -777,8 +891,10 @@ static void gmap_ucas_unmap_one(struct gmap *gmap, gfn_t c_gfn)
 	int rc;
 
 	rc = dat_entry_walk(NULL, c_gfn, gmap->asce, 0, TABLE_TYPE_SEGMENT, &crstep, &ptep);
-	if (!rc)
-		dat_crstep_xchg(crstep, _PMD_EMPTY, c_gfn, gmap->asce);
+	if (rc)
+		return;
+	while (!dat_crstep_xchg_atomic(crstep, READ_ONCE(*crstep), _PMD_EMPTY, c_gfn, gmap->asce))
+		;
 }
 
 void gmap_ucas_unmap(struct gmap *gmap, gfn_t c_gfn, unsigned long count)
@@ -908,7 +1024,8 @@ int gmap_pv_destroy_range(struct gmap *gmap, gfn_t start, gfn_t end, bool interr
 	return 0;
 }
 
-int gmap_insert_rmap(struct gmap *sg, gfn_t p_gfn, gfn_t r_gfn, int level)
+int gmap_insert_rmap(struct kvm_s390_mmu_cache *mc, struct gmap *sg, gfn_t p_gfn,
+		     gfn_t r_gfn, int level)
 {
 	struct vsie_rmap *rmap __free(kvfree) = NULL;
 	struct vsie_rmap *temp;
@@ -918,7 +1035,7 @@ int gmap_insert_rmap(struct gmap *sg, gfn_t p_gfn, gfn_t r_gfn, int level)
 	KVM_BUG_ON(!is_shadow(sg), sg->kvm);
 	lockdep_assert_held(&sg->host_to_rmap_lock);
 
-	rmap = kzalloc_obj(*rmap, GFP_ATOMIC);
+	rmap = kvm_s390_mmu_cache_alloc_rmap(mc);
 	if (!rmap)
 		return -ENOMEM;
 
@@ -946,13 +1063,15 @@ int gmap_insert_rmap(struct gmap *sg, gfn_t p_gfn, gfn_t r_gfn, int level)
 int gmap_protect_rmap(struct kvm_s390_mmu_cache *mc, struct gmap *sg, gfn_t p_gfn, gfn_t r_gfn,
 		      kvm_pfn_t pfn, int level, bool wr)
 {
+	unsigned long bitmask;
 	union crste *crstep;
 	union pgste pgste;
 	union pte *ptep;
 	union pte pte;
 	int flags, rc;
 
-	KVM_BUG_ON(!is_shadow(sg), sg->kvm);
+	if (KVM_BUG_ON(!is_shadow(sg) || level <= TABLE_TYPE_PAGE_TABLE, sg->kvm))
+		return -EINVAL;
 	lockdep_assert_held(&sg->parent->children_lock);
 
 	flags = DAT_WALK_SPLIT_ALLOC | (uses_skeys(sg->parent) ? DAT_WALK_USES_SKEYS : 0);
@@ -961,8 +1080,9 @@ int gmap_protect_rmap(struct kvm_s390_mmu_cache *mc, struct gmap *sg, gfn_t p_gf
 	if (rc)
 		return rc;
 	if (level <= TABLE_TYPE_REGION1) {
+		bitmask = -1UL << (8 + 11 * level);
 		scoped_guard(spinlock, &sg->host_to_rmap_lock)
-			rc = gmap_insert_rmap(sg, p_gfn, r_gfn, level);
+			rc = gmap_insert_rmap(mc, sg, p_gfn, r_gfn & bitmask, level);
 	}
 	if (rc)
 		return rc;
@@ -978,23 +1098,46 @@ int gmap_protect_rmap(struct kvm_s390_mmu_cache *mc, struct gmap *sg, gfn_t p_gf
 	return 0;
 }
 
-static long __set_cmma_dirty_pte(union pte *ptep, gfn_t gfn, gfn_t next, struct dat_walk *walk)
+static long __set_cmma_clean_pte(union pte *ptep, gfn_t gfn, gfn_t next, struct dat_walk *walk)
 {
-	__atomic64_or(PGSTE_CMMA_D_BIT, &pgste_of(ptep)->val);
+	union pgste pgste;
+
+	pgste = pgste_get_lock(ptep);
+	pgste.cmma_d = 0;
+	pgste_set_unlock(ptep, pgste);
+
 	if (need_resched())
 		return next;
 	return 0;
 }
 
-void gmap_set_cmma_all_dirty(struct gmap *gmap)
+static long __set_cmma_dirty_pte(union pte *ptep, gfn_t gfn, gfn_t next, struct dat_walk *walk)
 {
-	const struct dat_walk_ops ops = { .pte_entry = __set_cmma_dirty_pte, };
+	union pgste pgste;
+
+	pgste = pgste_get_lock(ptep);
+	if (!pgste.cmma_d)
+		atomic64_inc(walk->priv);
+	pgste.cmma_d = 1;
+	pgste_set_unlock(ptep, pgste);
+
+	if (need_resched())
+		return next;
+	return 0;
+}
+
+void _gmap_set_cmma_all(struct gmap *gmap, bool dirty)
+{
+	const struct dat_walk_ops ops = {
+		.pte_entry = dirty ? __set_cmma_dirty_pte : __set_cmma_clean_pte,
+	};
 	gfn_t gfn = 0;
 
 	do {
 		scoped_guard(read_lock, &gmap->kvm->mmu_lock)
 			gfn = _dat_walk_gfn_range(gfn, asce_end(gmap->asce), gmap->asce, &ops,
-						  DAT_WALK_IGN_HOLES, NULL);
+						  DAT_WALK_IGN_HOLES,
+						  &gmap->kvm->arch.cmma_dirty_pages);
 		cond_resched();
 	} while (gfn);
 }
@@ -1010,6 +1153,7 @@ static void gmap_unshadow_level(struct gmap *sg, gfn_t r_gfn, int level)
 	if (level > TABLE_TYPE_PAGE_TABLE)
 		align = 1UL << (11 * level + _SEGMENT_SHIFT);
 	kvm_s390_vsie_gmap_notifier(sg, ALIGN_DOWN(gaddr, align), ALIGN(gaddr + 1, align));
+	sg->invalidated = true;
 	if (dat_entry_walk(NULL, r_gfn, sg->asce, 0, level, &crstep, &ptep))
 		return;
 	if (ptep) {
@@ -1017,8 +1161,8 @@ static void gmap_unshadow_level(struct gmap *sg, gfn_t r_gfn, int level)
 			dat_ptep_xchg(ptep, _PTE_EMPTY, r_gfn, sg->asce, uses_skeys(sg));
 		return;
 	}
-	crste = READ_ONCE(*crstep);
-	dat_crstep_clear(crstep, r_gfn, sg->asce);
+
+	crste = dat_crstep_clear_atomic(crstep, r_gfn, sg->asce);
 	if (crste_leaf(crste) || crste.h.i)
 		return;
 	if (is_pmd(crste))
@@ -1062,8 +1206,10 @@ void _gmap_handle_vsie_unshadow_event(struct gmap *parent, gfn_t gfn)
 		}
 		scoped_guard(spinlock, &sg->host_to_rmap_lock)
 			head = radix_tree_delete(&sg->host_to_rmap, gfn);
-		gmap_for_each_rmap_safe(rmap, rnext, head)
+		gmap_for_each_rmap_safe(rmap, rnext, head) {
 			gmap_unshadow_level(sg, rmap->r_gfn, rmap->level);
+			kfree(rmap);
+		}
 	}
 }
 
@@ -1101,6 +1247,7 @@ struct gmap_protect_asce_top_level {
 static inline int __gmap_protect_asce_top_level(struct kvm_s390_mmu_cache *mc, struct gmap *sg,
 						struct gmap_protect_asce_top_level *context)
 {
+	struct gmap *parent;
 	int rc, i;
 
 	guard(write_lock)(&sg->kvm->mmu_lock);
@@ -1108,7 +1255,13 @@ static inline int __gmap_protect_asce_top_level(struct kvm_s390_mmu_cache *mc, s
 	if (kvm_s390_array_needs_retry_safe(sg->kvm, context->seq, context->f))
 		return -EAGAIN;
 
-	scoped_guard(spinlock, &sg->parent->children_lock) {
+	parent = READ_ONCE(sg->parent);
+	if (!parent)
+		return -EAGAIN;
+	scoped_guard(spinlock, &parent->children_lock) {
+		if (READ_ONCE(sg->parent) != parent)
+			return -EAGAIN;
+		sg->invalidated = false;
 		for (i = 0; i < CRST_TABLE_PAGES; i++) {
 			if (!context->f[i].valid)
 				continue;
@@ -1157,7 +1310,7 @@ static int gmap_protect_asce_top_level(struct kvm_s390_mmu_cache *mc, struct gma
 	/* Pairs with the smp_wmb() in kvm_mmu_invalidate_end(). */
 	smp_rmb();
 
-	rc = kvm_s390_get_guest_pages(sg->kvm, context.f, asce.rsto, asce.dt + 1, false);
+	rc = kvm_s390_get_guest_pages(sg->kvm, context.f, asce.rsto, asce.tl + 1, false);
 	if (rc > 0)
 		rc = -EFAULT;
 	if (!rc)
@@ -1190,6 +1343,9 @@ struct gmap *gmap_create_shadow(struct kvm_s390_mmu_cache *mc, struct gmap *pare
 {
 	struct gmap *sg, *new;
 	int rc;
+
+	if (WARN_ON(!parent))
+		return ERR_PTR(-EINVAL);
 
 	scoped_guard(spinlock, &parent->children_lock) {
 		sg = gmap_find_shadow(parent, asce, edat_level);

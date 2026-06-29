@@ -21,6 +21,7 @@
 #include <linux/resctrl.h>
 
 #include <asm/cpu_device_id.h>
+#include <asm/cpuid/api.h>
 #include <asm/msr.h>
 
 #include "internal.h"
@@ -301,7 +302,7 @@ static int __cntr_id_read(u32 cntr_id, u64 *val)
 	 * is set if the counter data is unavailable.
 	 */
 	wrmsr(MSR_IA32_QM_EVTSEL, ABMC_EXTENDED_EVT_ID | ABMC_EVT_ID, cntr_id);
-	rdmsrl(MSR_IA32_QM_CTR, msr_val);
+	rdmsrq(MSR_IA32_QM_CTR, msr_val);
 
 	if (msr_val & RMID_VAL_ERROR)
 		return -EIO;
@@ -364,7 +365,7 @@ void arch_mon_domain_online(struct rdt_resource *r, struct rdt_l3_mon_domain *d)
 		msr_clear_bit(MSR_RMID_SNC_CONFIG, 0);
 }
 
-/* CPU models that support MSR_RMID_SNC_CONFIG */
+/* CPU models that support SNC and MSR_RMID_SNC_CONFIG */
 static const struct x86_cpu_id snc_cpu_ids[] __initconst = {
 	X86_MATCH_VFM(INTEL_ICELAKE_X, 0),
 	X86_MATCH_VFM(INTEL_SAPPHIRERAPIDS_X, 0),
@@ -375,40 +376,19 @@ static const struct x86_cpu_id snc_cpu_ids[] __initconst = {
 	{}
 };
 
-/*
- * There isn't a simple hardware bit that indicates whether a CPU is running
- * in Sub-NUMA Cluster (SNC) mode. Infer the state by comparing the
- * number of CPUs sharing the L3 cache with CPU0 to the number of CPUs in
- * the same NUMA node as CPU0.
- * It is not possible to accurately determine SNC state if the system is
- * booted with a maxcpus=N parameter. That distorts the ratio of SNC nodes
- * to L3 caches. It will be OK if system is booted with hyperthreading
- * disabled (since this doesn't affect the ratio).
- */
 static __init int snc_get_config(void)
 {
-	struct cacheinfo *ci = get_cpu_cacheinfo_level(0, RESCTRL_L3_CACHE);
-	const cpumask_t *node0_cpumask;
-	int cpus_per_node, cpus_per_l3;
 	int ret;
 
-	if (!x86_match_cpu(snc_cpu_ids) || !ci)
+	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
 		return 1;
 
-	cpus_read_lock();
-	if (num_online_cpus() != num_present_cpus())
-		pr_warn("Some CPUs offline, SNC detection may be incorrect\n");
-	cpus_read_unlock();
+	ret = topology_num_nodes_per_package();
 
-	node0_cpumask = cpumask_of_node(cpu_to_node(0));
-
-	cpus_per_node = cpumask_weight(node0_cpumask);
-	cpus_per_l3 = cpumask_weight(&ci->shared_cpu_map);
-
-	if (!cpus_per_node || !cpus_per_l3)
+	if (ret > 1 && !x86_match_cpu(snc_cpu_ids)) {
+		pr_warn("CoD enabled system? Resctrl not supported\n");
 		return 1;
-
-	ret = cpus_per_l3 / cpus_per_node;
+	}
 
 	/* sanity check: Only valid results are 1, 2, 3, 4, 6 */
 	switch (ret) {
@@ -480,6 +460,7 @@ int __init rdt_get_l3_mon_config(struct rdt_resource *r)
 	    (rdt_cpu_has(X86_FEATURE_CQM_MBM_TOTAL) ||
 	     rdt_cpu_has(X86_FEATURE_CQM_MBM_LOCAL))) {
 		r->mon.mbm_cntr_assignable = true;
+		r->mon.mbm_cntr_configurable = true;
 		cpuid_count(0x80000020, 5, &eax, &ebx, &ecx, &edx);
 		r->mon.num_mbm_cntrs = (ebx & GENMASK(15, 0)) + 1;
 		hw_res->mbm_cntr_assign_enabled = true;
@@ -553,7 +534,7 @@ static void resctrl_abmc_config_one_amd(void *info)
 {
 	union l3_qos_abmc_cfg *abmc_cfg = info;
 
-	wrmsrl(MSR_IA32_L3_QOS_ABMC_CFG, abmc_cfg->full);
+	wrmsrq(MSR_IA32_L3_QOS_ABMC_CFG, abmc_cfg->full);
 }
 
 /*

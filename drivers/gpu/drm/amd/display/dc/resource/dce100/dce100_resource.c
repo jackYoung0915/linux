@@ -632,6 +632,7 @@ static struct link_encoder *dce100_link_encoder_create(
 	struct dc_context *ctx,
 	const struct encoder_init_data *enc_init_data)
 {
+	(void)ctx;
 	struct dce110_link_encoder *enc110 =
 		kzalloc_obj(struct dce110_link_encoder);
 	int link_regs_id;
@@ -650,9 +651,6 @@ static struct link_encoder *dce100_link_encoder_create(
 		return &enc110->base;
 	}
 
-	if (enc_init_data->hpd_source >= ARRAY_SIZE(link_enc_hpd_regs))
-		return NULL;
-
 	link_regs_id =
 		map_transmitter_id_to_phy_instance(enc_init_data->transmitter);
 
@@ -661,7 +659,8 @@ static struct link_encoder *dce100_link_encoder_create(
 				      &link_enc_feature,
 				      &link_enc_regs[link_regs_id],
 				      &link_enc_aux_regs[enc_init_data->channel - 1],
-				      &link_enc_hpd_regs[enc_init_data->hpd_source]);
+				      enc_init_data->hpd_source >= ARRAY_SIZE(link_enc_hpd_regs) ?
+				      NULL : &link_enc_hpd_regs[enc_init_data->hpd_source]);
 	return &enc110->base;
 }
 
@@ -805,7 +804,7 @@ static void dce100_resource_destruct(struct dce110_resource_pool *pool)
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_ddc; i++) {
 		if (pool->base.engines[i] != NULL)
 			dce110_engine_destroy(&pool->base.engines[i]);
 		if (pool->base.hw_i2cs[i] != NULL) {
@@ -851,6 +850,7 @@ static enum dc_status build_mapped_resource(
 		struct dc_state *context,
 		struct dc_stream_state *stream)
 {
+	(void)dc;
 	struct pipe_ctx *pipe_ctx = resource_get_otg_master_for_stream(&context->res_ctx, stream);
 
 	if (!pipe_ctx)
@@ -868,7 +868,8 @@ enum dc_status dce100_validate_bandwidth(
 	struct dc_state *context,
 	enum dc_validate_mode validate_mode)
 {
-	int i;
+	(void)validate_mode;
+	unsigned int i;
 	bool at_least_one_pipe = false;
 	struct dc_stream_state *stream = NULL;
 	const uint32_t max_pix_clk_khz = max(dc->clk_mgr->clks.max_supported_dispclk_khz, 400000);
@@ -928,6 +929,7 @@ enum dc_status dce100_validate_global(
 		struct dc  *dc,
 		struct dc_state *context)
 {
+	(void)dc;
 	if (!dce100_validate_surface_sets(context))
 		return DC_FAIL_SURFACE_VALIDATE;
 
@@ -963,6 +965,7 @@ static void dce100_destroy_resource_pool(struct resource_pool **pool)
 
 enum dc_status dce100_validate_plane(const struct dc_plane_state *plane_state, struct dc_caps *caps)
 {
+	(void)caps;
 
 	if (plane_state->format < SURFACE_PIXEL_FORMAT_VIDEO_BEGIN)
 		return DC_OK;
@@ -975,7 +978,7 @@ struct stream_encoder *dce100_find_first_free_match_stream_enc_for_link(
 		const struct resource_pool *pool,
 		struct dc_stream_state *stream)
 {
-	int i;
+	unsigned int i;
 	int j = -1;
 	struct dc_link *link = stream->link;
 	enum engine_id preferred_engine = link->link_enc->preferred_engine;
@@ -992,7 +995,7 @@ struct stream_encoder *dce100_find_first_free_match_stream_enc_for_link(
 			/* Store first available for MST second display
 			 * in daisy chain use case
 			 */
-			j = i;
+			j = (int)i;
 			if (pool->stream_enc[i]->id == preferred_engine)
 				return pool->stream_enc[i];
 		}
@@ -1041,7 +1044,7 @@ static bool dce100_resource_construct(
 
 	pool->base.res_cap = &res_cap;
 	pool->base.funcs = &dce100_res_pool_funcs;
-	pool->base.underlay_pipe_index = NO_UNDERLAY_PIPE;
+	pool->base.underlay_pipe_index = (unsigned int)NO_UNDERLAY_PIPE;
 
 	bp = ctx->dc_bios;
 
@@ -1113,7 +1116,7 @@ static bool dce100_resource_construct(
 	/*************************************************
 	*  Resource + asic cap harcoding                *
 	*************************************************/
-	pool->base.underlay_pipe_index = NO_UNDERLAY_PIPE;
+	pool->base.underlay_pipe_index = (unsigned int)NO_UNDERLAY_PIPE;
 	pool->base.pipe_count = res_cap.num_timing_generator;
 	pool->base.timing_generator_count = pool->base.res_cap->num_timing_generator;
 	dc->caps.max_downscale_ratio = 200;
@@ -1172,7 +1175,7 @@ static bool dce100_resource_construct(
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_ddc; i++) {
 		pool->base.engines[i] = dce100_aux_engine_create(ctx, i);
 		if (pool->base.engines[i] == NULL) {
 			BREAK_TO_DEBUGGER();

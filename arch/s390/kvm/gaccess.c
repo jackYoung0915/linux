@@ -1419,8 +1419,8 @@ edat_applies:
 	return kvm_s390_get_guest_page(kvm, entries + LEVEL_MEM, table.pte.pfra, wr);
 }
 
-static int _do_shadow_pte(struct gmap *sg, gpa_t raddr, union pte *ptep_h, union pte *ptep,
-			  struct guest_fault *f, bool p)
+static int _do_shadow_pte(struct kvm_s390_mmu_cache *mc, struct gmap *sg, gpa_t raddr,
+			  union pte *ptep_h, union pte *ptep, struct guest_fault *f, bool p)
 {
 	union pgste pgste;
 	union pte newpte;
@@ -1430,53 +1430,77 @@ static int _do_shadow_pte(struct gmap *sg, gpa_t raddr, union pte *ptep_h, union
 	lockdep_assert_held(&sg->parent->children_lock);
 
 	scoped_guard(spinlock, &sg->host_to_rmap_lock)
-		rc = gmap_insert_rmap(sg, f->gfn, gpa_to_gfn(raddr), TABLE_TYPE_PAGE_TABLE);
+		rc = gmap_insert_rmap(mc, sg, f->gfn, gpa_to_gfn(raddr), TABLE_TYPE_PAGE_TABLE);
 	if (rc)
 		return rc;
 
-	pgste = pgste_get_lock(ptep_h);
-	newpte = _pte(f->pfn, f->writable, !p, 0);
-	newpte.s.d |= ptep->s.d;
-	newpte.s.sd |= ptep->s.sd;
-	newpte.h.p &= ptep->h.p;
-	pgste = _gmap_ptep_xchg(sg->parent, ptep_h, newpte, pgste, f->gfn, false);
-	pgste.vsie_notif = 1;
+	if (!pgste_get_trylock(ptep_h, &pgste))
+		return -EAGAIN;
+	newpte = _pte(f->pfn, f->writable, !p, ptep_h->s.s);
+	newpte.s.d |= ptep_h->s.d;
+	newpte.s.sd |= ptep_h->s.sd;
+	newpte.h.p &= ptep_h->h.p;
+	if (!newpte.h.p && !f->writable) {
+		rc = -EOPNOTSUPP;
+	} else {
+		pgste = _gmap_ptep_xchg(sg->parent, ptep_h, newpte, pgste, f->gfn, false);
+		pgste.vsie_notif = 1;
+		pgste.vsie_gmem = 1;
+	}
 	pgste_set_unlock(ptep_h, pgste);
+	if (rc)
+		return rc;
+	if (sg->invalidated)
+		return -EAGAIN;
 
 	newpte = _pte(f->pfn, 0, !p, 0);
-	pgste = pgste_get_lock(ptep);
+	if (!pgste_get_trylock(ptep, &pgste))
+		return -EAGAIN;
 	pgste = __dat_ptep_xchg(ptep, pgste, newpte, gpa_to_gfn(raddr), sg->asce, uses_skeys(sg));
 	pgste_set_unlock(ptep, pgste);
 
 	return 0;
 }
 
-static int _do_shadow_crste(struct gmap *sg, gpa_t raddr, union crste *host, union crste *table,
-			    struct guest_fault *f, bool p)
+static int _do_shadow_crste(struct kvm_s390_mmu_cache *mc, struct gmap *sg, gpa_t raddr,
+			    union crste *host, union crste *table, struct guest_fault *f, bool p)
 {
-	union crste newcrste;
-	gfn_t gfn;
+	union crste newcrste, oldcrste;
+	unsigned long mask;
+	gfn_t r_gfn;
 	int rc;
 
 	lockdep_assert_held(&sg->kvm->mmu_lock);
 	lockdep_assert_held(&sg->parent->children_lock);
 
-	gfn = f->gfn & gpa_to_gfn(is_pmd(*table) ? _SEGMENT_MASK : _REGION3_MASK);
+	mask = is_pmd(*table) ? _SEGMENT_FR_MASK : _REGION3_FR_MASK;
+	r_gfn = gpa_to_gfn(raddr) & mask;
 	scoped_guard(spinlock, &sg->host_to_rmap_lock)
-		rc = gmap_insert_rmap(sg, gfn, gpa_to_gfn(raddr), host->h.tt);
+		rc = gmap_insert_rmap(mc, sg, f->gfn & mask, r_gfn, host->h.tt);
 	if (rc)
 		return rc;
 
-	newcrste = _crste_fc1(f->pfn, host->h.tt, f->writable, !p);
-	newcrste.s.fc1.d |= host->s.fc1.d;
-	newcrste.s.fc1.sd |= host->s.fc1.sd;
-	newcrste.h.p &= host->h.p;
-	newcrste.s.fc1.vsie_notif = 1;
-	newcrste.s.fc1.prefix_notif = host->s.fc1.prefix_notif;
-	_gmap_crstep_xchg(sg->parent, host, newcrste, f->gfn, false);
+	do {
+		/* _gmap_crstep_xchg_atomic() could have unshadowed this shadow gmap */
+		if (sg->invalidated)
+			return -EAGAIN;
+		oldcrste = READ_ONCE(*host);
+		newcrste = _crste_fc1(f->pfn, oldcrste.h.tt, f->writable, !p);
+		newcrste.s.fc1.d |= oldcrste.s.fc1.d;
+		newcrste.s.fc1.sd |= oldcrste.s.fc1.sd;
+		newcrste.h.p &= oldcrste.h.p;
+		newcrste.s.fc1.vsie_notif = 1;
+		newcrste.s.fc1.prefix_notif = oldcrste.s.fc1.prefix_notif;
+		newcrste.s.fc1.s = oldcrste.s.fc1.s;
+		if (!newcrste.h.p && !f->writable)
+			return -EOPNOTSUPP;
+	} while (!_gmap_crstep_xchg_atomic(sg->parent, host, oldcrste, newcrste, f->gfn, false));
+	if (sg->invalidated)
+		return -EAGAIN;
 
-	newcrste = _crste_fc1(f->pfn, host->h.tt, 0, !p);
-	dat_crstep_xchg(table, newcrste, gpa_to_gfn(raddr), sg->asce);
+	newcrste = _crste_fc1(f->pfn, oldcrste.h.tt, 0, !p);
+	while (!dat_crstep_xchg_atomic(table, READ_ONCE(*table), newcrste, r_gfn, sg->asce))
+		;
 	return 0;
 }
 
@@ -1500,21 +1524,31 @@ static int _gaccess_do_shadow(struct kvm_s390_mmu_cache *mc, struct gmap *sg,
 	if (rc)
 		return rc;
 
-	/* A race occourred. The shadow mapping is already valid, nothing to do */
-	if ((ptep && !ptep->h.i) || (!ptep && crste_leaf(*table)))
+	/* A race occurred. The shadow mapping is already valid, nothing to do */
+	if ((ptep && !ptep->h.i && ptep->h.p == w->p) ||
+	    (!ptep && crste_leaf(*table) && !table->h.i && table->h.p == w->p))
 		return 0;
 
 	gl = get_level(table, ptep);
+
+	/* In case of a real address space */
+	if (w->level <= LEVEL_MEM) {
+		l = TABLE_TYPE_PAGE_TABLE;
+		hl = TABLE_TYPE_REGION1;
+		goto real_address_space;
+	}
 
 	/*
 	 * Skip levels that are already protected. For each level, protect
 	 * only the page containing the entry, not the whole table.
 	 */
 	for (i = gl ; i >= w->level; i--) {
-		rc = gmap_protect_rmap(mc, sg, entries[i - 1].gfn, gpa_to_gfn(saddr),
-				       entries[i - 1].pfn, i, entries[i - 1].writable);
+		rc = gmap_protect_rmap(mc, sg, entries[i].gfn, gpa_to_gfn(saddr),
+				       entries[i].pfn, i + 1, entries[i].writable);
 		if (rc)
 			return rc;
+		if (sg->invalidated)
+			return -EAGAIN;
 	}
 
 	rc = dat_entry_walk(NULL, entries[LEVEL_MEM].gfn, sg->parent->asce, DAT_WALK_LEAF,
@@ -1526,6 +1560,7 @@ static int _gaccess_do_shadow(struct kvm_s390_mmu_cache *mc, struct gmap *sg,
 	/* Get the smallest granularity */
 	l = min3(gl, hl, w->level);
 
+real_address_space:
 	flags = DAT_WALK_SPLIT_ALLOC | (uses_skeys(sg->parent) ? DAT_WALK_USES_SKEYS : 0);
 	/* If necessary, create the shadow mapping */
 	if (l < gl) {
@@ -1543,38 +1578,52 @@ static int _gaccess_do_shadow(struct kvm_s390_mmu_cache *mc, struct gmap *sg,
 	if (KVM_BUG_ON(l > TABLE_TYPE_REGION3, sg->kvm))
 		return -EFAULT;
 	if (l == TABLE_TYPE_PAGE_TABLE)
-		return _do_shadow_pte(sg, saddr, ptep_h, ptep, entries + LEVEL_MEM, w->p);
-	return _do_shadow_crste(sg, saddr, host, table, entries + LEVEL_MEM, w->p);
+		return _do_shadow_pte(mc, sg, saddr, ptep_h, ptep, entries + LEVEL_MEM, w->p);
+	return _do_shadow_crste(mc, sg, saddr, host, table, entries + LEVEL_MEM, w->p);
+}
+
+static inline int ___gaccess_shadow_fault(struct kvm_vcpu *vcpu, struct gmap *sg, gpa_t saddr,
+					  unsigned long seq, struct pgtwalk *walk)
+{
+	struct gmap *parent;
+	int rc;
+
+	if (kvm_s390_array_needs_retry_safe(vcpu->kvm, seq, walk->raw_entries))
+		return -EAGAIN;
+	parent = READ_ONCE(sg->parent);
+	if (!parent)
+		return -EAGAIN;
+	scoped_guard(spinlock, &parent->children_lock) {
+		if (READ_ONCE(sg->parent) != parent)
+			return -EAGAIN;
+		sg->invalidated = false;
+		rc = _gaccess_do_shadow(vcpu->arch.mc, sg, saddr, walk);
+	}
+	if (!rc)
+		kvm_s390_release_faultin_array(vcpu->kvm, walk->raw_entries, false);
+	return rc;
 }
 
 static inline int _gaccess_shadow_fault(struct kvm_vcpu *vcpu, struct gmap *sg, gpa_t saddr,
 					unsigned long seq, struct pgtwalk *walk)
 {
-	struct gmap *parent;
 	int rc;
 
 	if (kvm_s390_array_needs_retry_unsafe(vcpu->kvm, seq, walk->raw_entries))
 		return -EAGAIN;
-again:
-	rc = kvm_s390_mmu_cache_topup(vcpu->arch.mc);
-	if (rc)
-		return rc;
-	scoped_guard(read_lock, &vcpu->kvm->mmu_lock) {
-		if (kvm_s390_array_needs_retry_safe(vcpu->kvm, seq, walk->raw_entries))
-			return -EAGAIN;
-		parent = READ_ONCE(sg->parent);
-		if (!parent)
-			return -EAGAIN;
-		scoped_guard(spinlock, &parent->children_lock) {
-			if (READ_ONCE(sg->parent) != parent)
-				return -EAGAIN;
-			rc = _gaccess_do_shadow(vcpu->arch.mc, sg, saddr, walk);
-		}
-		if (rc == -ENOMEM)
-			goto again;
-		if (!rc)
-			kvm_s390_release_faultin_array(vcpu->kvm, walk->raw_entries, false);
-	}
+
+	do {
+		rc = kvm_s390_mmu_cache_topup(vcpu->arch.mc);
+		if (rc)
+			return rc;
+		rc = radix_tree_preload(GFP_KERNEL);
+		if (rc)
+			return rc;
+		scoped_guard(read_lock, &vcpu->kvm->mmu_lock)
+			rc = ___gaccess_shadow_fault(vcpu, sg, saddr, seq, walk);
+		radix_tree_preload_end();
+	} while (rc == -ENOMEM);
+
 	return rc;
 }
 

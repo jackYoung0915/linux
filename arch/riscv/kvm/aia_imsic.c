@@ -683,6 +683,9 @@ bool kvm_riscv_vcpu_aia_imsic_has_interrupt(struct kvm_vcpu *vcpu)
 	unsigned long flags;
 	bool ret = false;
 
+	if (!imsic)
+		return false;
+
 	/*
 	 * The IMSIC SW-file directly injects interrupt via hvip so
 	 * only check for interrupt when IMSIC VS-file is being used.
@@ -722,6 +725,9 @@ void kvm_riscv_vcpu_aia_imsic_put(struct kvm_vcpu *vcpu)
 	struct imsic *imsic = vcpu->arch.aia_context.imsic_state;
 	unsigned long flags;
 
+	if (!imsic)
+		return;
+
 	if (!kvm_vcpu_is_blocking(vcpu))
 		return;
 
@@ -737,6 +743,9 @@ void kvm_riscv_vcpu_aia_imsic_release(struct kvm_vcpu *vcpu)
 	struct imsic_mrif tmrif;
 	int old_vsfile_hgei, old_vsfile_cpu;
 	struct imsic *imsic = vcpu->arch.aia_context.imsic_state;
+
+	if (!imsic)
+		return;
 
 	/* Read and clear IMSIC VS-file details */
 	write_lock_irqsave(&imsic->vsfile_lock, flags);
@@ -907,6 +916,10 @@ int kvm_riscv_vcpu_aia_imsic_rmw(struct kvm_vcpu *vcpu, unsigned long isel,
 	struct imsic_mrif_eix *eix;
 	int r, rc = KVM_INSN_CONTINUE_NEXT_SEPC;
 	struct imsic *imsic = vcpu->arch.aia_context.imsic_state;
+
+	/* If IMSIC vCPU state not initialized then forward to user space */
+	if (!imsic)
+		return KVM_INSN_EXIT_TO_USER_SPACE;
 
 	if (isel == KVM_RISCV_AIA_IMSIC_TOPEI) {
 		/* Read pending and enabled interrupt with highest priority */

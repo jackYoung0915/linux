@@ -27,11 +27,6 @@ struct sdca_function_desc;
 #define SDCA_MAX_ENTITY_COUNT 128
 
 /*
- * Sanity check on number of initialization writes, can be expanded if needed.
- */
-#define SDCA_MAX_INIT_COUNT 2048
-
-/*
  * The Cluster IDs are 16-bit, so a maximum of 65535 Clusters per
  * function can be represented, however limit this to a slightly
  * more reasonable value. Can be expanded if needed.
@@ -1457,7 +1452,6 @@ static inline u32 sdca_range_search(struct sdca_control_range *range,
 }
 
 int sdca_parse_function(struct device *dev, struct sdw_slave *sdw,
-			struct sdca_function_desc *desc,
 			struct sdca_function_data *function);
 
 const char *sdca_find_terminal_name(enum sdca_terminal_type type);

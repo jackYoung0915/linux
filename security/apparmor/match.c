@@ -27,13 +27,13 @@
  * @blob: data to unpack (NOT NULL)
  * @bsize: size of blob
  *
- * Returns: pointer to table else NULL on failure
+ * Returns: pointer to table else ERR_PTR on failure
  *
  * NOTE: must be freed by kvfree (not kfree)
  */
 static struct table_header *unpack_table(char *blob, size_t bsize)
 {
-	struct table_header *table = NULL;
+	struct table_header *table = ERR_PTR(-EPROTO);
 	struct table_header th;
 	size_t tsize;
 
@@ -74,20 +74,21 @@ static struct table_header *unpack_table(char *blob, size_t bsize)
 		else if (th.td_flags == YYTD_DATA32)
 			UNPACK_ARRAY(table->td_data, blob, th.td_lolen,
 				     u32, __be32, get_unaligned_be32);
-		else
-			goto fail;
+		else {
+			kvfree(table);
+			table = ERR_PTR(-EPROTO);
+			goto out;
+		}
 		/* if table was vmalloced make sure the page tables are synced
 		 * before it is used, as it goes live to all cpus.
 		 */
 		if (is_vmalloc_addr(table))
 			vm_unmap_aliases();
-	}
+	} else
+		table = ERR_PTR(-ENOMEM);
 
 out:
 	return table;
-fail:
-	kvfree(table);
-	return NULL;
 }
 
 /**
@@ -157,12 +158,13 @@ static int verify_dfa(struct aa_dfa *dfa)
 
 	state_count = dfa->tables[YYTD_ID_BASE]->td_lolen;
 	trans_count = dfa->tables[YYTD_ID_NXT]->td_lolen;
-	if (state_count == 0)
+	if (state_count < 2)
 		goto out;
 	for (i = 0; i < state_count; i++) {
-		if (!(BASE_TABLE(dfa)[i] & MATCH_FLAG_DIFF_ENCODE) &&
-		    (DEFAULT_TABLE(dfa)[i] >= state_count))
+		if (DEFAULT_TABLE(dfa)[i] >= state_count) {
+			pr_err("AppArmor DFA default state out of bounds");
 			goto out;
+		}
 		if (BASE_TABLE(dfa)[i] & MATCH_FLAGS_INVALID) {
 			pr_err("AppArmor DFA state with invalid match flags");
 			goto out;
@@ -201,15 +203,30 @@ static int verify_dfa(struct aa_dfa *dfa)
 		size_t j, k;
 
 		for (j = i;
-		     (BASE_TABLE(dfa)[j] & MATCH_FLAG_DIFF_ENCODE) &&
-		     !(BASE_TABLE(dfa)[j] & MARK_DIFF_ENCODE);
+		     ((BASE_TABLE(dfa)[j] & MATCH_FLAG_DIFF_ENCODE) &&
+		      !(BASE_TABLE(dfa)[j] & MARK_DIFF_ENCODE_VERIFIED));
 		     j = k) {
+			if (BASE_TABLE(dfa)[j] & MARK_DIFF_ENCODE)
+				/* loop in current chain */
+				goto out;
 			k = DEFAULT_TABLE(dfa)[j];
 			if (j == k)
+				/* self loop */
 				goto out;
-			if (k < j)
-				break;		/* already verified */
 			BASE_TABLE(dfa)[j] |= MARK_DIFF_ENCODE;
+		}
+		/* move mark to verified */
+		for (j = i;
+		     (BASE_TABLE(dfa)[j] & MATCH_FLAG_DIFF_ENCODE);
+		     j = k) {
+			k = DEFAULT_TABLE(dfa)[j];
+			if (j < i)
+				/* jumps to state/chain that has been
+				 * verified
+				 */
+				break;
+			BASE_TABLE(dfa)[j] &= ~MARK_DIFF_ENCODE;
+			BASE_TABLE(dfa)[j] |= MARK_DIFF_ENCODE_VERIFIED;
 		}
 	}
 	error = 0;
@@ -343,8 +360,11 @@ struct aa_dfa *aa_dfa_unpack(void *blob, size_t size, int flags)
 
 	while (size > 0) {
 		table = unpack_table(data, size);
-		if (!table)
+		if (IS_ERR(table)) {
+			error = PTR_ERR(table);
+			table = NULL;
 			goto fail;
+		}
 
 		switch (table->td_id) {
 		case YYTD_ID_ACCEPT:
@@ -463,13 +483,18 @@ aa_state_t aa_dfa_match_len(struct aa_dfa *dfa, aa_state_t start,
 	if (dfa->tables[YYTD_ID_EC]) {
 		/* Equivalence class table defined */
 		u8 *equiv = EQUIV_TABLE(dfa);
-		for (; len; len--)
-			match_char(state, def, base, next, check,
-				   equiv[(u8) *str++]);
+		for (; len; len--) {
+			u8 c = equiv[(u8) *str];
+
+			match_char(state, def, base, next, check, c);
+			str++;
+		}
 	} else {
 		/* default is direct to next state */
-		for (; len; len--)
-			match_char(state, def, base, next, check, (u8) *str++);
+		for (; len; len--) {
+			match_char(state, def, base, next, check, (u8) *str);
+			str++;
+		}
 	}
 
 	return state;
@@ -503,13 +528,18 @@ aa_state_t aa_dfa_match(struct aa_dfa *dfa, aa_state_t start, const char *str)
 		/* Equivalence class table defined */
 		u8 *equiv = EQUIV_TABLE(dfa);
 		/* default is direct to next state */
-		while (*str)
-			match_char(state, def, base, next, check,
-				   equiv[(u8) *str++]);
+		while (*str) {
+			u8 c = equiv[(u8) *str];
+
+			match_char(state, def, base, next, check, c);
+			str++;
+		}
 	} else {
 		/* default is direct to next state */
-		while (*str)
-			match_char(state, def, base, next, check, (u8) *str++);
+		while (*str) {
+			match_char(state, def, base, next, check, (u8) *str);
+			str++;
+		}
 	}
 
 	return state;

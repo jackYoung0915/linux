@@ -79,6 +79,7 @@ struct hv_vp_register_page {
 
 		u64 registers[18];
 	};
+	u8 reserved[8];
 	/* Volatile XMM registers (HV_X64_REGISTER_CLASS_XMM) */
 	union {
 		struct {
@@ -779,7 +780,7 @@ struct hv_x64_intercept_message_header {
 	u32 vp_index;
 	u8 instruction_length:4;
 	u8 cr8:4; /* Only set for exo partitions */
-	u8 intercept_access_type;
+	u8 intercept_access_type; /* enum hv_intercept_access_type */
 	union hv_x64_vp_execution_state execution_state;
 	struct hv_x64_segment_register cs_segment;
 	u64 rip;
@@ -825,7 +826,7 @@ union hv_arm64_vp_execution_state {
 struct hv_arm64_intercept_message_header {
 	u32 vp_index;
 	u8 instruction_length;
-	u8 intercept_access_type;
+	u8 intercept_access_type; /* enum hv_intercept_access_type */
 	union hv_arm64_vp_execution_state execution_state;
 	u64 pc;
 	u64 cpsr;

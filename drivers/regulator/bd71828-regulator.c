@@ -785,7 +785,7 @@ static const struct bd71828_regulator_data bd71828_rdata[] = {
 	},
 };
 
-#define BD72720_BUCK10_DESC_INDEX 10
+#define BD72720_BUCK10_DESC_INDEX 9
 #define BD72720_NUM_BUCK_VOLTS 0x100
 #define BD72720_NUM_LDO_VOLTS 0x100
 #define BD72720_NUM_LDO12346_VOLTS 0x80
@@ -1691,9 +1691,9 @@ static int bd71828_probe(struct platform_device *pdev)
 }
 
 static const struct platform_device_id bd71828_pmic_id[] = {
-	{ "bd71828-pmic", ROHM_CHIP_TYPE_BD71828 },
-	{ "bd72720-pmic", ROHM_CHIP_TYPE_BD72720 },
-	{ },
+	{ .name = "bd71828-pmic", .driver_data = ROHM_CHIP_TYPE_BD71828 },
+	{ .name = "bd72720-pmic", .driver_data = ROHM_CHIP_TYPE_BD72720 },
+	{ }
 };
 MODULE_DEVICE_TABLE(platform, bd71828_pmic_id);
 

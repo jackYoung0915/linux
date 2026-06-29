@@ -173,7 +173,7 @@ static int linedisp_display(struct linedisp *linedisp, const char *msg,
 		count = strlen(msg);
 
 	/* if the string ends with a newline, trim it */
-	if (msg[count - 1] == '\n')
+	if (count && msg[count - 1] == '\n')
 		count--;
 
 	if (!count) {
@@ -365,7 +365,7 @@ static DEFINE_IDA(linedisp_id);
 
 static void linedisp_release(struct device *dev)
 {
-	struct linedisp *linedisp = to_linedisp(dev);
+	struct linedisp *linedisp = container_of(dev, struct linedisp, dev);
 
 	kfree(linedisp->map);
 	kfree(linedisp->message);

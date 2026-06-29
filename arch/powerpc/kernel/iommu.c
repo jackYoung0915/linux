@@ -13,6 +13,7 @@
 #include <linux/init.h>
 #include <linux/types.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/mm.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -141,7 +142,7 @@ late_initcall(fail_iommu_debugfs);
 static ssize_t fail_iommu_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", dev->archdata.fail_iommu);
+	return sysfs_emit(buf, "%d\n", dev->archdata.fail_iommu);
 }
 
 static ssize_t fail_iommu_store(struct device *dev,
@@ -1159,7 +1160,7 @@ spapr_tce_platform_iommu_attach_dev(struct iommu_domain *platform_domain,
 				    struct device *dev,
 				    struct iommu_domain *old)
 {
-	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	struct iommu_domain *domain = iommu_driver_get_domain_for_dev(dev);
 	struct iommu_table_group *table_group;
 	struct iommu_group *grp;
 

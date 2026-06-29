@@ -36,7 +36,7 @@
 
 /* Supported SST hardware version by this driver */
 #define ISST_MAJOR_VERSION	0
-#define ISST_MINOR_VERSION	2
+#define ISST_MINOR_VERSION	3
 
 /*
  * Used to indicate if value read from MMIO needs to get multiplied
@@ -558,6 +558,9 @@ static bool disable_dynamic_sst_features(void)
 {
 	u64 value;
 
+	if (!static_cpu_has(X86_FEATURE_HWP))
+		return true;
+
 	rdmsrq(MSR_PM_ENABLE, value);
 	return !(value & 0x1);
 }
@@ -869,7 +872,7 @@ static int isst_if_get_perf_level(void __user *argp)
 	_read_pp_info("current_level", perf_level.current_level, SST_PP_STATUS_OFFSET,
 		      SST_PP_LEVEL_START, SST_PP_LEVEL_WIDTH, SST_MUL_FACTOR_NONE)
 	_read_pp_info("locked", perf_level.locked, SST_PP_STATUS_OFFSET,
-		      SST_PP_LOCK_START, SST_PP_LEVEL_WIDTH, SST_MUL_FACTOR_NONE)
+		      SST_PP_LOCK_START, SST_PP_LOCK_WIDTH, SST_MUL_FACTOR_NONE)
 	_read_pp_info("feature_state", perf_level.feature_state, SST_PP_STATUS_OFFSET,
 		      SST_PP_FEATURE_STATE_START, SST_PP_FEATURE_STATE_WIDTH, SST_MUL_FACTOR_NONE)
 	perf_level.enabled = !!(power_domain_info->sst_header.cap_mask & BIT(1));
@@ -1458,6 +1461,8 @@ static int isst_if_get_turbo_freq_info(void __user *argp)
 					    SST_MUL_FACTOR_FREQ)
 	}
 
+	memset(turbo_freq.bucket_core_counts, 0, sizeof(turbo_freq.bucket_core_counts));
+
 	if (feature_rev >= 2) {
 		bool has_tf_info_8 = false;
 
@@ -1799,7 +1804,7 @@ process_pp_resume:
 		if (!(pd_info->sst_header.cap_mask & SST_PP_CAP_PP_ENABLE))
 			continue;
 
-		writeq(pd_info->saved_pp_control, power_domain_info->sst_base +
+		writeq(pd_info->saved_pp_control, pd_info->sst_base +
 		       pd_info->sst_header.pp_offset + SST_PP_CONTROL_OFFSET);
 	}
 }

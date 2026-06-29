@@ -26,6 +26,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/configfs.h>
+#include <linux/blk-mq.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_tcq.h>
 #include <scsi/scsi_host.h>
@@ -269,30 +270,6 @@ static int tcm_loop_device_reset(struct scsi_cmnd *sc)
 	return (ret == TMR_FUNCTION_COMPLETE) ? SUCCESS : FAILED;
 }
 
-static int tcm_loop_target_reset(struct scsi_cmnd *sc)
-{
-	struct tcm_loop_hba *tl_hba;
-	struct tcm_loop_tpg *tl_tpg;
-
-	/*
-	 * Locate the tcm_loop_hba_t pointer
-	 */
-	tl_hba = *(struct tcm_loop_hba **)shost_priv(sc->device->host);
-	if (!tl_hba) {
-		pr_err("Unable to perform device reset without active I_T Nexus\n");
-		return FAILED;
-	}
-	/*
-	 * Locate the tl_tpg pointer from TargetID in sc->device->id
-	 */
-	tl_tpg = &tl_hba->tl_hba_tpgs[sc->device->id];
-	if (tl_tpg) {
-		tl_tpg->tl_transport_status = TCM_TRANSPORT_ONLINE;
-		return SUCCESS;
-	}
-	return FAILED;
-}
-
 static const struct scsi_host_template tcm_loop_driver_template = {
 	.show_info		= tcm_loop_show_info,
 	.proc_name		= "tcm_loopback",
@@ -301,7 +278,6 @@ static const struct scsi_host_template tcm_loop_driver_template = {
 	.change_queue_depth	= scsi_change_queue_depth,
 	.eh_abort_handler = tcm_loop_abort_task,
 	.eh_device_reset_handler = tcm_loop_device_reset,
-	.eh_target_reset_handler = tcm_loop_target_reset,
 	.this_id		= -1,
 	.sg_tablesize		= 256,
 	.max_sectors		= 0xFFFF,
@@ -353,6 +329,7 @@ static int tcm_loop_driver_probe(struct device *dev)
 	if (error) {
 		pr_err("%s: scsi_add_host failed\n", __func__);
 		scsi_host_put(sh);
+		tl_hba->sh = NULL;
 		return -ENODEV;
 	}
 	return 0;
@@ -366,8 +343,10 @@ static void tcm_loop_driver_remove(struct device *dev)
 	tl_hba = to_tcm_loop_hba(dev);
 	sh = tl_hba->sh;
 
-	scsi_remove_host(sh);
-	scsi_host_put(sh);
+	if (sh) {
+		scsi_remove_host(sh);
+		scsi_host_put(sh);
+	}
 }
 
 static void tcm_loop_release_adapter(struct device *dev)
@@ -393,6 +372,11 @@ static int tcm_loop_setup_hba_bus(struct tcm_loop_hba *tl_hba, int tcm_loop_host
 	if (ret) {
 		pr_err("device_register() failed for tl_hba->dev: %d\n", ret);
 		put_device(&tl_hba->dev);
+		return -ENODEV;
+	}
+
+	if (!tl_hba->sh) {
+		device_unregister(&tl_hba->dev);
 		return -ENODEV;
 	}
 
@@ -1107,6 +1091,7 @@ static const struct target_core_fabric_ops loop_ops = {
 	.tfc_wwn_attrs			= tcm_loop_wwn_attrs,
 	.tfc_tpg_base_attrs		= tcm_loop_tpg_attrs,
 	.tfc_tpg_attrib_attrs		= tcm_loop_tpg_attrib_attrs,
+	.default_compl_type		= TARGET_QUEUE_COMPL,
 	.default_submit_type		= TARGET_QUEUE_SUBMIT,
 	.direct_submit_supp		= 0,
 };

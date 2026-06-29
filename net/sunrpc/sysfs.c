@@ -6,6 +6,7 @@
 #include <linux/kobject.h>
 #include <linux/sunrpc/addr.h>
 #include <linux/sunrpc/xprtsock.h>
+#include <net/net_namespace.h>
 
 #include "sysfs.h"
 
@@ -326,7 +327,7 @@ static ssize_t rpc_sysfs_xprt_switch_add_xprt_store(struct kobject *kobj,
 {
 	struct rpc_xprt_switch *xprt_switch =
 		rpc_sysfs_xprt_switch_kobj_get_xprt(kobj);
-	struct xprt_create xprt_create_args;
+	struct xprt_create xprt_create_args = {};
 	struct rpc_xprt *xprt, *new;
 
 	if (!xprt_switch)
@@ -347,7 +348,7 @@ static ssize_t rpc_sysfs_xprt_switch_add_xprt_store(struct kobject *kobj,
 	xprt_create_args.reconnect_timeout = xprt->max_reconnect_timeout;
 
 	new = xprt_create_transport(&xprt_create_args);
-	if (IS_ERR_OR_NULL(new)) {
+	if (IS_ERR(new)) {
 		count = PTR_ERR(new);
 		goto out_put_xprt;
 	}
@@ -553,20 +554,22 @@ static void rpc_sysfs_xprt_release(struct kobject *kobj)
 	kfree(xprt);
 }
 
-static const void *rpc_sysfs_client_namespace(const struct kobject *kobj)
+static const struct ns_common *rpc_sysfs_client_namespace(const struct kobject *kobj)
 {
-	return container_of(kobj, struct rpc_sysfs_client, kobject)->net;
+	return to_ns_common(container_of(kobj, struct rpc_sysfs_client,
+					 kobject)->net);
 }
 
-static const void *rpc_sysfs_xprt_switch_namespace(const struct kobject *kobj)
+static const struct ns_common *rpc_sysfs_xprt_switch_namespace(const struct kobject *kobj)
 {
-	return container_of(kobj, struct rpc_sysfs_xprt_switch, kobject)->net;
+	return to_ns_common(container_of(kobj, struct rpc_sysfs_xprt_switch,
+					 kobject)->net);
 }
 
-static const void *rpc_sysfs_xprt_namespace(const struct kobject *kobj)
+static const struct ns_common *rpc_sysfs_xprt_namespace(const struct kobject *kobj)
 {
-	return container_of(kobj, struct rpc_sysfs_xprt,
-			    kobject)->xprt->xprt_net;
+	return to_ns_common(container_of(kobj, struct rpc_sysfs_xprt,
+					 kobject)->xprt->xprt_net);
 }
 
 static struct kobj_attribute rpc_sysfs_clnt_version = __ATTR(rpc_version,

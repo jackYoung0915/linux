@@ -58,6 +58,8 @@ static int hac300s_read_word_data(struct i2c_client *client, int page,
 	case PMBUS_MFR_VOUT_MIN:
 	case PMBUS_READ_VOUT:
 		rv = pmbus_read_word_data(client, page, phase, reg);
+		if (rv < 0)
+			return rv;
 		return FIELD_GET(LINEAR11_MANTISSA_MASK, rv);
 	default:
 		return -ENODATA;
@@ -110,8 +112,8 @@ static const struct of_device_id hac300s_of_match[] = {
 MODULE_DEVICE_TABLE(of, hac300s_of_match);
 
 static const struct i2c_device_id hac300s_id[] = {
-	{"hac300s", 0},
-	{}
+	{ .name = "hac300s" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, hac300s_id);
 

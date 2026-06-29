@@ -442,13 +442,15 @@ int drm_syncobj_find_fence(struct drm_file *file_private,
 	u64 timeout = nsecs_to_jiffies64(DRM_SYNCOBJ_WAIT_FOR_SUBMIT_TIMEOUT);
 	int ret;
 
-	if (flags & ~DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT)
-		return -EINVAL;
-
 	if (!syncobj)
 		return -ENOENT;
 
-	/* Waiting for userspace with locks help is illegal cause that can
+	if (flags & ~DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* Waiting for userspace with locks held is illegal cause that can
 	 * trivial deadlock with page faults for example. Make lockdep complain
 	 * about it early on.
 	 */
@@ -602,7 +604,7 @@ int drm_syncobj_get_handle(struct drm_file *file_private,
 	drm_syncobj_get(syncobj);
 
 	ret = xa_alloc(&file_private->syncobj_xa, handle, syncobj, xa_limit_32b,
-		       GFP_NOWAIT);
+		       GFP_KERNEL);
 	if (ret)
 		drm_syncobj_put(syncobj);
 
@@ -716,7 +718,7 @@ static int drm_syncobj_fd_to_handle(struct drm_file *file_private,
 	drm_syncobj_get(syncobj);
 
 	ret = xa_alloc(&file_private->syncobj_xa, handle, syncobj, xa_limit_32b,
-		       GFP_NOWAIT);
+		       GFP_KERNEL);
 	if (ret)
 		drm_syncobj_put(syncobj);
 

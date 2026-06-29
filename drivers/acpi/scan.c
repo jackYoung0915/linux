@@ -6,6 +6,7 @@
 #define pr_fmt(fmt) "ACPI: " fmt
 
 #include <linux/async.h>
+#include <linux/auxiliary_bus.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
@@ -121,7 +122,7 @@ bool acpi_scan_is_offline(struct acpi_device *adev, bool uevent)
 	mutex_lock_nested(&adev->physical_node_lock, SINGLE_DEPTH_NESTING);
 
 	list_for_each_entry(pn, &adev->physical_node_list, node)
-		if (device_supports_offline(pn->dev) && !pn->dev->offline) {
+		if (device_supports_offline(pn->dev) && !dev_offline(pn->dev)) {
 			if (uevent)
 				kobject_uevent_env(&pn->dev->kobj, KOBJ_CHANGE, envp);
 
@@ -847,8 +848,6 @@ static bool acpi_info_matches_ids(struct acpi_device_info *info,
 static const char * const acpi_ignore_dep_ids[] = {
 	"PNP0D80", /* Windows-compatible System Power Management Controller */
 	"INT33BD", /* Intel Baytrail Mailbox Device */
-	"INTC10DE", /* Intel CVS LNL */
-	"INTC10E0", /* Intel CVS ARL */
 	"LATT2021", /* Lattice FW Update Client Driver */
 	NULL
 };
@@ -860,11 +859,15 @@ static const char * const acpi_honor_dep_ids[] = {
 	"INTC1095", /* IVSC (ADL) driver must be loaded to allow i2c access to camera sensors */
 	"INTC100A", /* IVSC (RPL) driver must be loaded to allow i2c access to camera sensors */
 	"INTC10CF", /* IVSC (MTL) driver must be loaded to allow i2c access to camera sensors */
+	"INTC10DE", /* CVS (LNL) driver must be loaded to allow camera streaming */
+	"INTC10E0", /* CVS (ARL) driver must be loaded to allow camera streaming */
+	"INTC10E1", /* CVS (PTL) driver must be loaded to allow camera streaming */
 	"RSCV0001", /* RISC-V PLIC */
 	"RSCV0002", /* RISC-V APLIC */
 	"RSCV0005", /* RISC-V SBI MPXY MBOX */
 	"RSCV0006", /* RISC-V RPMI SYSMSI */
 	"PNP0C0F",  /* PCI Link Device */
+	"ACPI0016", /* CXL/PCIe host bridge: CXL root (ACPI0017) depends on PCI root attach */
 	NULL
 };
 
@@ -1899,7 +1902,7 @@ static int acpi_add_single_object(struct acpi_device **child,
 		result = acpi_device_add(device);
 
 	if (result) {
-		acpi_device_release(&device->dev);
+		acpi_dev_put(device);
 		return result;
 	}
 
@@ -2192,6 +2195,44 @@ static acpi_status acpi_bus_check_add_2(acpi_handle handle, u32 lvl_not_used,
 	return acpi_bus_check_add(handle, false, (struct acpi_device **)ret_p);
 }
 
+static void acpi_video_bus_device_release(struct device *dev)
+{
+	struct auxiliary_device *aux_dev = to_auxiliary_dev(dev);
+
+	kfree(aux_dev);
+}
+
+static void acpi_create_video_bus_device(struct acpi_device *adev,
+					 struct acpi_device *parent)
+{
+	struct auxiliary_device *aux_dev;
+	static unsigned int aux_dev_id;
+
+	aux_dev = kzalloc_obj(*aux_dev);
+	if (!aux_dev)
+		return;
+
+	aux_dev->id = aux_dev_id++;
+	aux_dev->name = "video_bus";
+	aux_dev->dev.parent = acpi_get_first_physical_node(parent);
+	if (!aux_dev->dev.parent)
+		goto err;
+
+	aux_dev->dev.release = acpi_video_bus_device_release;
+
+	if (auxiliary_device_init(aux_dev))
+		goto err;
+
+	ACPI_COMPANION_SET(&aux_dev->dev, adev);
+	if (__auxiliary_device_add(aux_dev, "acpi"))
+		auxiliary_device_uninit(aux_dev);
+
+	return;
+
+err:
+	kfree(aux_dev);
+}
+
 struct acpi_scan_system_dev {
 	struct list_head node;
 	struct acpi_device *adev;
@@ -2229,6 +2270,12 @@ static void acpi_default_enumeration(struct acpi_device *device)
 			sd->adev = device;
 			list_add_tail(&sd->node, &acpi_scan_system_dev_list);
 		}
+	} else if (device->pnp.type.backlight) {
+		struct acpi_device *parent;
+
+		parent = acpi_dev_parent(device);
+		if (parent)
+			acpi_create_video_bus_device(device, parent);
 	} else {
 		/* For a regular device object, create a platform device. */
 		acpi_create_platform_device(device, NULL);

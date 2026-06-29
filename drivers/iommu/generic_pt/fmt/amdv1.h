@@ -191,7 +191,7 @@ static inline enum pt_entry_type amdv1pt_load_entry_raw(struct pt_state *pts)
 }
 #define pt_load_entry_raw amdv1pt_load_entry_raw
 
-static inline void
+static __always_inline void
 amdv1pt_install_leaf_entry(struct pt_state *pts, pt_oaddr_t oa,
 			   unsigned int oasz_lg2,
 			   const struct pt_write_attrs *attrs)
@@ -404,6 +404,7 @@ amdv1pt_iommu_fmt_hw_info(struct pt_iommu_amdv1 *table,
 static const struct pt_iommu_amdv1_cfg amdv1_kunit_fmt_cfgs[] = {
 	/* Matches what io_pgtable does */
 	[0] = { .starting_level = 2 },
+	[1] = { .starting_level = 2, .common.hw_max_vasz_lg2 = 32 },
 };
 #define kunit_fmt_cfgs amdv1_kunit_fmt_cfgs
 enum { KUNIT_FMT_FEATURES = 0 };

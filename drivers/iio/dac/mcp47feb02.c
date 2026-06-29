@@ -65,7 +65,7 @@
 #define MCP47FEB02_MAX_SCALES_CH			3
 #define MCP47FEB02_DAC_WIPER_UNLOCKED			0
 #define MCP47FEB02_NORMAL_OPERATION			0
-#define MCP47FEB02_INTERNAL_BAND_GAP_mV			2440
+#define MCP47FEB02_INTERNAL_BAND_GAP_uV			2440000
 #define NV_DAC_ADDR_OFFSET				0x10
 
 enum mcp47feb02_vref_mode {
@@ -697,44 +697,40 @@ static const struct iio_chan_spec mcp47febxx_ch_template = {
 };
 
 static void mcp47feb02_init_scale(struct mcp47feb02_data *data, enum mcp47feb02_scale scale,
-				  int vref_mV, int scale_avail[])
+				  int vref_uV, int scale_avail[])
 {
 	u32 value_micro, value_int;
 	u64 tmp;
 
-	/* vref_mV should not be negative */
-	tmp = (u64)vref_mV * MICRO >> data->chip_features->resolution;
+	/* vref_uV should not be negative */
+	tmp = (u64)vref_uV * MILLI >> data->chip_features->resolution;
 	value_int = div_u64_rem(tmp, MICRO, &value_micro);
 	scale_avail[scale * 2] = value_int;
 	scale_avail[scale * 2 + 1] = value_micro;
 }
 
-static int mcp47feb02_init_scales_avail(struct mcp47feb02_data *data, int vdd_mV,
-					int vref_mV, int vref1_mV)
+static int mcp47feb02_init_scales_avail(struct mcp47feb02_data *data, int vdd_uV,
+					int vref_uV, int vref1_uV)
 {
-	struct device *dev = regmap_get_device(data->regmap);
 	int tmp_vref;
 
-	mcp47feb02_init_scale(data, MCP47FEB02_SCALE_VDD, vdd_mV, data->scale);
+	mcp47feb02_init_scale(data, MCP47FEB02_SCALE_VDD, vdd_uV, data->scale);
 
 	if (data->use_vref)
-		tmp_vref = vref_mV;
+		tmp_vref = vref_uV;
 	else
-		tmp_vref = MCP47FEB02_INTERNAL_BAND_GAP_mV;
+		tmp_vref = MCP47FEB02_INTERNAL_BAND_GAP_uV;
 
 	mcp47feb02_init_scale(data, MCP47FEB02_SCALE_GAIN_X1, tmp_vref, data->scale);
 	mcp47feb02_init_scale(data, MCP47FEB02_SCALE_GAIN_X2, tmp_vref * 2, data->scale);
 
 	if (data->phys_channels >= 4) {
-		mcp47feb02_init_scale(data, MCP47FEB02_SCALE_VDD, vdd_mV, data->scale_1);
-
-		if (data->use_vref1 && vref1_mV <= 0)
-			return dev_err_probe(dev, vref1_mV, "Invalid voltage for Vref1\n");
+		mcp47feb02_init_scale(data, MCP47FEB02_SCALE_VDD, vdd_uV, data->scale_1);
 
 		if (data->use_vref1)
-			tmp_vref = vref1_mV;
+			tmp_vref = vref1_uV;
 		else
-			tmp_vref = MCP47FEB02_INTERNAL_BAND_GAP_mV;
+			tmp_vref = MCP47FEB02_INTERNAL_BAND_GAP_uV;
 
 		mcp47feb02_init_scale(data, MCP47FEB02_SCALE_GAIN_X1,
 				      tmp_vref, data->scale_1);
@@ -955,8 +951,6 @@ static int mcp47feb02_parse_fw(struct iio_dev *indio_dev,
 	u32 num_channels;
 	u8 chan_idx = 0;
 
-	guard(mutex)(&data->lock);
-
 	num_channels = device_get_child_node_count(dev);
 	if (num_channels > chip_features->phys_channels)
 		return dev_err_probe(dev, -EINVAL, "More channels than the chip supports\n");
@@ -1080,8 +1074,8 @@ static int mcp47feb02_init_ctrl_regs(struct mcp47feb02_data *data)
 	return 0;
 }
 
-static int mcp47feb02_init_ch_scales(struct mcp47feb02_data *data, int vdd_mV,
-				     int vref_mV, int vref1_mV)
+static int mcp47feb02_init_ch_scales(struct mcp47feb02_data *data, int vdd_uV,
+				     int vref_uV, int vref1_uV)
 {
 	unsigned int i;
 
@@ -1089,7 +1083,7 @@ static int mcp47feb02_init_ch_scales(struct mcp47feb02_data *data, int vdd_mV,
 		struct device *dev = regmap_get_device(data->regmap);
 		int ret;
 
-		ret = mcp47feb02_init_scales_avail(data, vdd_mV, vref_mV, vref1_mV);
+		ret = mcp47feb02_init_scales_avail(data, vdd_uV, vref_uV, vref1_uV);
 		if (ret)
 			return dev_err_probe(dev, ret, "failed to init scales for ch %u\n", i);
 	}
@@ -1103,10 +1097,7 @@ static int mcp47feb02_probe(struct i2c_client *client)
 	struct device *dev = &client->dev;
 	struct mcp47feb02_data *data;
 	struct iio_dev *indio_dev;
-	int vref1_mV = 0;
-	int vref_mV = 0;
-	int vdd_mV;
-	int ret;
+	int vref1_uV, vref_uV, vdd_uV, ret;
 
 	indio_dev = devm_iio_device_alloc(dev, sizeof(*data));
 	if (!indio_dev)
@@ -1143,13 +1134,14 @@ static int mcp47feb02_probe(struct i2c_client *client)
 	if (ret < 0)
 		return ret;
 
-	vdd_mV = ret / MILLI;
+	vdd_uV = ret;
 
 	ret = devm_regulator_get_enable_read_voltage(dev, "vref");
 	if (ret > 0) {
-		vref_mV = ret / MILLI;
+		vref_uV = ret;
 		data->use_vref = true;
 	} else {
+		vref_uV = 0;
 		dev_dbg(dev, "using internal band gap as voltage reference.\n");
 		dev_dbg(dev, "Vref is unavailable.\n");
 	}
@@ -1157,9 +1149,10 @@ static int mcp47feb02_probe(struct i2c_client *client)
 	if (chip_features->have_ext_vref1) {
 		ret = devm_regulator_get_enable_read_voltage(dev, "vref1");
 		if (ret > 0) {
-			vref1_mV = ret / MILLI;
+			vref1_uV = ret;
 			data->use_vref1 = true;
 		} else {
+			vref1_uV = 0;
 			dev_dbg(dev, "using internal band gap as voltage reference 1.\n");
 			dev_dbg(dev, "Vref1 is unavailable.\n");
 		}
@@ -1169,7 +1162,7 @@ static int mcp47feb02_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret, "Error initialising vref register\n");
 
-	ret = mcp47feb02_init_ch_scales(data, vdd_mV, vref_mV, vref1_mV);
+	ret = mcp47feb02_init_ch_scales(data, vdd_uV, vref_uV, vref1_uV);
 	if (ret)
 		return ret;
 
@@ -1177,30 +1170,30 @@ static int mcp47feb02_probe(struct i2c_client *client)
 }
 
 static const struct i2c_device_id mcp47feb02_id[] = {
-	{ "mcp47feb01", (kernel_ulong_t)&mcp47feb01_chip_features },
-	{ "mcp47feb02", (kernel_ulong_t)&mcp47feb02_chip_features },
-	{ "mcp47feb04", (kernel_ulong_t)&mcp47feb04_chip_features },
-	{ "mcp47feb08", (kernel_ulong_t)&mcp47feb08_chip_features },
-	{ "mcp47feb11", (kernel_ulong_t)&mcp47feb11_chip_features },
-	{ "mcp47feb12", (kernel_ulong_t)&mcp47feb12_chip_features },
-	{ "mcp47feb14", (kernel_ulong_t)&mcp47feb14_chip_features },
-	{ "mcp47feb18", (kernel_ulong_t)&mcp47feb18_chip_features },
-	{ "mcp47feb21", (kernel_ulong_t)&mcp47feb21_chip_features },
-	{ "mcp47feb22", (kernel_ulong_t)&mcp47feb22_chip_features },
-	{ "mcp47feb24", (kernel_ulong_t)&mcp47feb24_chip_features },
-	{ "mcp47feb28", (kernel_ulong_t)&mcp47feb28_chip_features },
-	{ "mcp47fvb01", (kernel_ulong_t)&mcp47fvb01_chip_features },
-	{ "mcp47fvb02", (kernel_ulong_t)&mcp47fvb02_chip_features },
-	{ "mcp47fvb04", (kernel_ulong_t)&mcp47fvb04_chip_features },
-	{ "mcp47fvb08", (kernel_ulong_t)&mcp47fvb08_chip_features },
-	{ "mcp47fvb11", (kernel_ulong_t)&mcp47fvb11_chip_features },
-	{ "mcp47fvb12", (kernel_ulong_t)&mcp47fvb12_chip_features },
-	{ "mcp47fvb14", (kernel_ulong_t)&mcp47fvb14_chip_features },
-	{ "mcp47fvb18", (kernel_ulong_t)&mcp47fvb18_chip_features },
-	{ "mcp47fvb21", (kernel_ulong_t)&mcp47fvb21_chip_features },
-	{ "mcp47fvb22", (kernel_ulong_t)&mcp47fvb22_chip_features },
-	{ "mcp47fvb24", (kernel_ulong_t)&mcp47fvb24_chip_features },
-	{ "mcp47fvb28", (kernel_ulong_t)&mcp47fvb28_chip_features },
+	{ .name = "mcp47feb01", .driver_data = (kernel_ulong_t)&mcp47feb01_chip_features },
+	{ .name = "mcp47feb02", .driver_data = (kernel_ulong_t)&mcp47feb02_chip_features },
+	{ .name = "mcp47feb04", .driver_data = (kernel_ulong_t)&mcp47feb04_chip_features },
+	{ .name = "mcp47feb08", .driver_data = (kernel_ulong_t)&mcp47feb08_chip_features },
+	{ .name = "mcp47feb11", .driver_data = (kernel_ulong_t)&mcp47feb11_chip_features },
+	{ .name = "mcp47feb12", .driver_data = (kernel_ulong_t)&mcp47feb12_chip_features },
+	{ .name = "mcp47feb14", .driver_data = (kernel_ulong_t)&mcp47feb14_chip_features },
+	{ .name = "mcp47feb18", .driver_data = (kernel_ulong_t)&mcp47feb18_chip_features },
+	{ .name = "mcp47feb21", .driver_data = (kernel_ulong_t)&mcp47feb21_chip_features },
+	{ .name = "mcp47feb22", .driver_data = (kernel_ulong_t)&mcp47feb22_chip_features },
+	{ .name = "mcp47feb24", .driver_data = (kernel_ulong_t)&mcp47feb24_chip_features },
+	{ .name = "mcp47feb28", .driver_data = (kernel_ulong_t)&mcp47feb28_chip_features },
+	{ .name = "mcp47fvb01", .driver_data = (kernel_ulong_t)&mcp47fvb01_chip_features },
+	{ .name = "mcp47fvb02", .driver_data = (kernel_ulong_t)&mcp47fvb02_chip_features },
+	{ .name = "mcp47fvb04", .driver_data = (kernel_ulong_t)&mcp47fvb04_chip_features },
+	{ .name = "mcp47fvb08", .driver_data = (kernel_ulong_t)&mcp47fvb08_chip_features },
+	{ .name = "mcp47fvb11", .driver_data = (kernel_ulong_t)&mcp47fvb11_chip_features },
+	{ .name = "mcp47fvb12", .driver_data = (kernel_ulong_t)&mcp47fvb12_chip_features },
+	{ .name = "mcp47fvb14", .driver_data = (kernel_ulong_t)&mcp47fvb14_chip_features },
+	{ .name = "mcp47fvb18", .driver_data = (kernel_ulong_t)&mcp47fvb18_chip_features },
+	{ .name = "mcp47fvb21", .driver_data = (kernel_ulong_t)&mcp47fvb21_chip_features },
+	{ .name = "mcp47fvb22", .driver_data = (kernel_ulong_t)&mcp47fvb22_chip_features },
+	{ .name = "mcp47fvb24", .driver_data = (kernel_ulong_t)&mcp47fvb24_chip_features },
+	{ .name = "mcp47fvb28", .driver_data = (kernel_ulong_t)&mcp47fvb28_chip_features },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, mcp47feb02_id);

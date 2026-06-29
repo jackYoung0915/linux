@@ -667,11 +667,12 @@ static struct link_encoder *dce110_link_encoder_create(
 	struct dc_context *ctx,
 	const struct encoder_init_data *enc_init_data)
 {
+	(void)ctx;
 	struct dce110_link_encoder *enc110 =
 		kzalloc_obj(struct dce110_link_encoder);
 	int link_regs_id;
 
-	if (!enc110 || enc_init_data->hpd_source >= ARRAY_SIZE(link_enc_hpd_regs))
+	if (!enc110)
 		return NULL;
 
 	link_regs_id =
@@ -682,7 +683,8 @@ static struct link_encoder *dce110_link_encoder_create(
 				      &link_enc_feature,
 				      &link_enc_regs[link_regs_id],
 				      &link_enc_aux_regs[enc_init_data->channel - 1],
-				      &link_enc_hpd_regs[enc_init_data->hpd_source]);
+				      enc_init_data->hpd_source >= ARRAY_SIZE(link_enc_hpd_regs) ?
+				      NULL : &link_enc_hpd_regs[enc_init_data->hpd_source]);
 	return &enc110->base;
 }
 
@@ -837,7 +839,7 @@ static void dce110_resource_destruct(struct dce110_resource_pool *pool)
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_ddc; i++) {
 		if (pool->base.engines[i] != NULL)
 			dce110_engine_destroy(&pool->base.engines[i]);
 		if (pool->base.hw_i2cs[i] != NULL) {
@@ -970,6 +972,7 @@ static enum dc_status dce110_validate_bandwidth(
 	struct dc_state *context,
 	enum dc_validate_mode validate_mode)
 {
+	(void)validate_mode;
 	bool result = false;
 
 	DC_LOG_BANDWIDTH_CALCS(
@@ -1042,6 +1045,7 @@ static enum dc_status dce110_validate_bandwidth(
 static enum dc_status dce110_validate_plane(const struct dc_plane_state *plane_state,
 					    struct dc_caps *caps)
 {
+	(void)caps;
 	if (((plane_state->dst_rect.width * 2) < plane_state->src_rect.width) ||
 	    ((plane_state->dst_rect.height * 2) < plane_state->src_rect.height))
 		return DC_FAIL_SURFACE_VALIDATE;
@@ -1098,6 +1102,7 @@ static enum dc_status dce110_validate_global(
 		struct dc *dc,
 		struct dc_state *context)
 {
+	(void)dc;
 	if (!dce110_validate_surface_sets(context))
 		return DC_FAIL_SURFACE_VALIDATE;
 
@@ -1129,6 +1134,7 @@ static struct pipe_ctx *dce110_acquire_underlay(
 		const struct resource_pool *pool,
 		const struct pipe_ctx *opp_head_pipe)
 {
+	(void)cur_ctx;
 	struct dc_stream_state *stream = opp_head_pipe->stream;
 	struct dc *dc = stream->ctx->dc;
 	struct dce_hwseq *hws = dc->hwseq;
@@ -1144,7 +1150,7 @@ static struct pipe_ctx *dce110_acquire_underlay(
 	/*pipe_ctx->plane_res.ipp = res_ctx->pool->ipps[underlay_idx];*/
 	pipe_ctx->plane_res.xfm = pool->transforms[underlay_idx];
 	pipe_ctx->stream_res.opp = pool->opps[underlay_idx];
-	pipe_ctx->pipe_idx = underlay_idx;
+	pipe_ctx->pipe_idx = (uint8_t)underlay_idx;
 
 	pipe_ctx->stream = stream;
 
@@ -1154,7 +1160,7 @@ static struct pipe_ctx *dce110_acquire_underlay(
 
 		hws->funcs.enable_display_power_gating(
 				dc,
-				pipe_ctx->stream_res.tg->inst,
+				(uint8_t)pipe_ctx->stream_res.tg->inst,
 				dcb, PIPE_GATING_CONTROL_DISABLE);
 
 		/*
@@ -1207,7 +1213,7 @@ struct stream_encoder *dce110_find_first_free_match_stream_enc_for_link(
 		const struct resource_pool *pool,
 		struct dc_stream_state *stream)
 {
-	int i;
+	unsigned int i;
 	int j = -1;
 	struct dc_link *link = stream->link;
 
@@ -1217,7 +1223,7 @@ struct stream_encoder *dce110_find_first_free_match_stream_enc_for_link(
 			/* Store first available for MST second display
 			 * in daisy chain use case
 			 */
-			j = i;
+			j = (int)i;
 			if (pool->stream_enc[i]->id ==
 					link->link_enc->preferred_engine)
 				return pool->stream_enc[i];
@@ -1353,6 +1359,7 @@ static bool dce110_resource_construct(
 	struct dce110_resource_pool *pool,
 	struct hw_asic_id asic_id)
 {
+	(void)asic_id;
 	unsigned int i;
 	struct dc_context *ctx = dc->ctx;
 	struct dc_bios *bp;
@@ -1485,7 +1492,7 @@ static bool dce110_resource_construct(
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_ddc; i++) {
 		pool->base.engines[i] = dce110_aux_engine_create(ctx, i);
 		if (pool->base.engines[i] == NULL) {
 			BREAK_TO_DEBUGGER();

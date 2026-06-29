@@ -296,13 +296,9 @@
 &gpmi {
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_gpmi_nand>;
+	nand-on-flash-bbt;
 	fsl,no-blockmark-swap;
 	status = "okay";
-
-	nand@0 {
-		reg = <0>;
-		nand-on-flash-bbt;
-	};
 };
 
 &i2c2 {
@@ -321,7 +317,7 @@
 	};
 
 	polytouch: polytouch@38 {
-		compatible = "edt,edt-ft5x06";
+		compatible = "edt,edt-ft5206";
 		reg = <0x38>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&pinctrl_edt_ft5x06>;

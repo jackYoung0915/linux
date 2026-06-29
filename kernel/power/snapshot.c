@@ -1244,8 +1244,9 @@ unsigned int snapshot_additional_pages(struct zone *zone)
 static void mark_free_pages(struct zone *zone)
 {
 	unsigned long pfn, max_zone_pfn, page_count = WD_PAGE_COUNT;
+	struct list_head *free_list;
 	unsigned long flags;
-	unsigned int order, t;
+	unsigned int order;
 	struct page *page;
 
 	if (zone_is_empty(zone))
@@ -1269,9 +1270,8 @@ static void mark_free_pages(struct zone *zone)
 			swsusp_unset_page_free(page);
 	}
 
-	for_each_migratetype_order(order, t) {
-		list_for_each_entry(page,
-				&zone->free_area[order].free_list[t], buddy_list) {
+	for_each_free_list(free_list, zone, order) {
+		list_for_each_entry(page, free_list, buddy_list) {
 			unsigned long i;
 
 			pfn = page_to_pfn(page);
@@ -2855,6 +2855,17 @@ int snapshot_write_finalize(struct snapshot_handle *handle)
 {
 	int error;
 
+	/*
+	 * Call snapshot_write_next() to drain any trailing zero pages,
+	 * but make sure we're in the data page region first.
+	 * This function can return PAGE_SIZE if the kernel was expecting
+	 * another copy page. Return -ENODATA in that situation.
+	 */
+	if (handle->cur > nr_meta_pages + 1) {
+		error = snapshot_write_next(handle);
+		if (error)
+			return error > 0 ? -ENODATA : error;
+	}
 	copy_last_highmem_page();
 	error = hibernate_restore_protect_page(handle->buffer);
 	/* Do that only if we have loaded the image entirely */

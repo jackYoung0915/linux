@@ -256,13 +256,15 @@ static int gpo_bd72720_probe(struct platform_device *pdev)
 	g->dev = dev;
 	g->chip.parent = parent;
 	g->regmap = dev_get_regmap(parent, NULL);
+	if (!g->regmap)
+		return -ENODEV;
 
 	return devm_gpiochip_add_data(dev, &g->chip, g);
 }
 
 static const struct platform_device_id bd72720_gpio_id[] = {
-	{ "bd72720-gpio" },
-	{ },
+	{ .name = "bd72720-gpio" },
+	{ }
 };
 MODULE_DEVICE_TABLE(platform, bd72720_gpio_id);
 

@@ -308,18 +308,6 @@ static void pwr_island_trickle_drive_40xx(struct ivpu_device *vdev, bool enable)
 
 static void pwr_island_drive_37xx(struct ivpu_device *vdev, bool enable)
 {
-	u32 val = REGV_RD32(VPU_40XX_HOST_SS_AON_PWR_ISLAND_EN0);
-
-	if (enable)
-		val = REG_SET_FLD(VPU_40XX_HOST_SS_AON_PWR_ISLAND_EN0, CSS_CPU, val);
-	else
-		val = REG_CLR_FLD(VPU_40XX_HOST_SS_AON_PWR_ISLAND_EN0, CSS_CPU, val);
-
-	REGV_WR32(VPU_40XX_HOST_SS_AON_PWR_ISLAND_EN0, val);
-}
-
-static void pwr_island_drive_40xx(struct ivpu_device *vdev, bool enable)
-{
 	u32 val = REGV_RD32(VPU_37XX_HOST_SS_AON_PWR_ISLAND_EN0);
 
 	if (enable)
@@ -328,6 +316,18 @@ static void pwr_island_drive_40xx(struct ivpu_device *vdev, bool enable)
 		val = REG_CLR_FLD(VPU_37XX_HOST_SS_AON_PWR_ISLAND_EN0, MSS_CPU, val);
 
 	REGV_WR32(VPU_37XX_HOST_SS_AON_PWR_ISLAND_EN0, val);
+}
+
+static void pwr_island_drive_40xx(struct ivpu_device *vdev, bool enable)
+{
+	u32 val = REGV_RD32(VPU_40XX_HOST_SS_AON_PWR_ISLAND_EN0);
+
+	if (enable)
+		val = REG_SET_FLD(VPU_40XX_HOST_SS_AON_PWR_ISLAND_EN0, CSS_CPU, val);
+	else
+		val = REG_CLR_FLD(VPU_40XX_HOST_SS_AON_PWR_ISLAND_EN0, CSS_CPU, val);
+
+	REGV_WR32(VPU_40XX_HOST_SS_AON_PWR_ISLAND_EN0, val);
 }
 
 static void pwr_island_enable(struct ivpu_device *vdev)
@@ -931,7 +931,6 @@ static int soc_cpu_boot_40xx(struct ivpu_device *vdev)
 
 static int soc_cpu_boot_60xx(struct ivpu_device *vdev)
 {
-	REGV_WR64(VPU_40XX_HOST_SS_AON_RETENTION1, vdev->fw->mem_bp->vpu_addr);
 	soc_cpu_set_entry_point_40xx(vdev, vdev->fw->cold_boot_entry_point);
 
 	return 0;

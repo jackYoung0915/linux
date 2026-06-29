@@ -59,6 +59,7 @@
 #include "dml/display_mode_vba.h"
 #include "dcn301/dcn301_dccg.h"
 #include "dcn10/dcn10_resource.h"
+#include "dio/dcn10/dcn10_dio.h"
 #include "dcn30/dcn30_dio_stream_encoder.h"
 #include "dcn301/dcn301_dio_link_encoder.h"
 #include "dcn301/dcn301_panel_cntl.h"
@@ -643,6 +644,7 @@ static struct resource_caps res_cap_dcn301 = {
 	.num_video_plane = 4,
 	.num_audio = 4,
 	.num_stream_encoder = 4,
+	.num_hpo_frl = 0,
 	.num_pll = 4,
 	.num_dwb = 1,
 	.num_ddc = 4,
@@ -843,6 +845,33 @@ static struct hubbub *dcn301_hubbub_create(struct dc_context *ctx)
 	return &hubbub3->base;
 }
 
+static const struct dcn_dio_registers dio_regs = {
+		DIO_REG_LIST_DCN10()
+};
+
+#define DIO_MASK_SH_LIST(mask_sh)\
+		HWS_SF(, DIO_MEM_PWR_CTRL, I2C_LIGHT_SLEEP_FORCE, mask_sh)
+
+static const struct dcn_dio_shift dio_shift = {
+		DIO_MASK_SH_LIST(__SHIFT)
+};
+
+static const struct dcn_dio_mask dio_mask = {
+		DIO_MASK_SH_LIST(_MASK)
+};
+
+static struct dio *dcn301_dio_create(struct dc_context *ctx)
+{
+	struct dcn10_dio *dio10 = kzalloc_obj(struct dcn10_dio);
+
+	if (!dio10)
+		return NULL;
+
+	dcn10_dio_construct(dio10, ctx, &dio_regs, &dio_shift, &dio_mask);
+
+	return &dio10->base;
+}
+
 static struct timing_generator *dcn301_timing_generator_create(
 	struct dc_context *ctx, uint32_t instance)
 {
@@ -880,6 +909,7 @@ static struct link_encoder *dcn301_link_encoder_create(
 	struct dc_context *ctx,
 	const struct encoder_init_data *enc_init_data)
 {
+	(void)ctx;
 	struct dcn20_link_encoder *enc20 =
 		kzalloc_obj(struct dcn20_link_encoder);
 
@@ -1053,7 +1083,7 @@ static void dcn301_destruct(struct dcn301_resource_pool *pool)
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_dsc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_dsc; i++) {
 		if (pool->base.dscs[i] != NULL)
 			dcn20_dsc_destroy(&pool->base.dscs[i]);
 	}
@@ -1066,6 +1096,12 @@ static void dcn301_destruct(struct dcn301_resource_pool *pool)
 		kfree(pool->base.hubbub);
 		pool->base.hubbub = NULL;
 	}
+
+	if (pool->base.dio != NULL) {
+		kfree(TO_DCN10_DIO(pool->base.dio));
+		pool->base.dio = NULL;
+	}
+
 	for (i = 0; i < pool->base.pipe_count; i++) {
 		if (pool->base.dpps[i] != NULL)
 			dcn301_dpp_destroy(&pool->base.dpps[i]);
@@ -1083,7 +1119,7 @@ static void dcn301_destruct(struct dcn301_resource_pool *pool)
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_ddc; i++) {
 		if (pool->base.engines[i] != NULL)
 			dce110_engine_destroy(&pool->base.engines[i]);
 		if (pool->base.hw_i2cs[i] != NULL) {
@@ -1096,19 +1132,19 @@ static void dcn301_destruct(struct dcn301_resource_pool *pool)
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_opp; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_opp; i++) {
 		if (pool->base.opps[i] != NULL)
 			pool->base.opps[i]->funcs->opp_destroy(&pool->base.opps[i]);
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_timing_generator; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_timing_generator; i++) {
 		if (pool->base.timing_generators[i] != NULL)	{
 			kfree(DCN10TG_FROM_TG(pool->base.timing_generators[i]));
 			pool->base.timing_generators[i] = NULL;
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_dwb; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_dwb; i++) {
 		if (pool->base.dwbc[i] != NULL) {
 			kfree(TO_DCN30_DWBC(pool->base.dwbc[i]));
 			pool->base.dwbc[i] = NULL;
@@ -1131,7 +1167,7 @@ static void dcn301_destruct(struct dcn301_resource_pool *pool)
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_mpc_3dlut; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_mpc_3dlut; i++) {
 		if (pool->base.mpc_lut[i] != NULL) {
 			dc_3dlut_func_release(pool->base.mpc_lut[i]);
 			pool->base.mpc_lut[i] = NULL;
@@ -1147,7 +1183,7 @@ static void dcn301_destruct(struct dcn301_resource_pool *pool)
 		pool->base.dp_clock_source = NULL;
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_timing_generator; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_timing_generator; i++) {
 		if (pool->base.multiple_abms[i] != NULL)
 			dce_abm_destroy(&pool->base.multiple_abms[i]);
 	}
@@ -1175,7 +1211,7 @@ static struct hubp *dcn301_hubp_create(struct dc_context *ctx, uint32_t inst)
 
 static bool dcn301_dwbc_create(struct dc_context *ctx, struct resource_pool *pool)
 {
-	int i;
+	unsigned int i;
 	uint32_t pipe_count = pool->res_cap->num_dwb;
 
 	for (i = 0; i < pipe_count; i++) {
@@ -1199,7 +1235,7 @@ static bool dcn301_dwbc_create(struct dc_context *ctx, struct resource_pool *poo
 
 static bool dcn301_mmhubbub_create(struct dc_context *ctx, struct resource_pool *pool)
 {
-	int i;
+	unsigned int i;
 	uint32_t pipe_count = pool->res_cap->num_dwb;
 
 	for (i = 0; i < pipe_count; i++) {
@@ -1323,7 +1359,7 @@ static void set_wm_ranges(
 		struct _vcs_dpi_soc_bounding_box_st *loaded_bb)
 {
 	struct pp_smu_wm_range_sets ranges = {0};
-	int i;
+	unsigned int i;
 
 	ranges.num_reader_wm_sets = 0;
 
@@ -1337,7 +1373,7 @@ static void set_wm_ranges(
 		ranges.num_reader_wm_sets = 1;
 	} else if (loaded_bb->num_states > 1) {
 		for (i = 0; i < 4 && i < loaded_bb->num_states; i++) {
-			ranges.reader_wm_sets[i].wm_inst = i;
+			ranges.reader_wm_sets[i].wm_inst = (uint8_t)i;
 			ranges.reader_wm_sets[i].min_drain_clk_mhz = PP_SMU_WM_SET_RANGE_CLK_UNCONSTRAINED_MIN;
 			ranges.reader_wm_sets[i].max_drain_clk_mhz = PP_SMU_WM_SET_RANGE_CLK_UNCONSTRAINED_MAX;
 			DC_FP_START();
@@ -1400,7 +1436,8 @@ static struct resource_funcs dcn301_res_pool_funcs = {
 	.release_post_bldn_3dlut = dcn30_release_post_bldn_3dlut,
 	.update_bw_bounding_box = dcn301_update_bw_bounding_box,
 	.patch_unknown_plane_state = dcn20_patch_unknown_plane_state,
-	.get_vstartup_for_pipe = dcn10_get_vstartup_for_pipe
+	.get_vstartup_for_pipe = dcn10_get_vstartup_for_pipe,
+	.get_default_tiling_info = dcn10_get_default_tiling_info,
 };
 
 static bool dcn301_resource_construct(
@@ -1408,7 +1445,8 @@ static bool dcn301_resource_construct(
 	struct dc *dc,
 	struct dcn301_resource_pool *pool)
 {
-	int i, j;
+	int j;
+	unsigned int i;
 	struct dc_context *ctx = dc->ctx;
 	struct irq_service_init_data init_data;
 	uint32_t pipe_fuses = read_pipe_fuses(ctx);
@@ -1427,7 +1465,7 @@ static bool dcn301_resource_construct(
 	/*************************************************
 	 *  Resource + asic cap harcoding                *
 	 *************************************************/
-	pool->base.underlay_pipe_index = NO_UNDERLAY_PIPE;
+	pool->base.underlay_pipe_index = (unsigned int)NO_UNDERLAY_PIPE;
 	pool->base.pipe_count = pool->base.res_cap->num_timing_generator;
 	pool->base.mpcc_count = pool->base.res_cap->num_timing_generator;
 	dc->caps.max_downscale_ratio = 600;
@@ -1470,7 +1508,7 @@ static bool dcn301_resource_construct(
 	dc->caps.color.dpp.ocsc = 0;
 
 	dc->caps.color.mpc.gamut_remap = 1;
-	dc->caps.color.mpc.num_3dluts = pool->base.res_cap->num_mpc_3dlut; //2
+	dc->caps.color.mpc.num_3dluts = (uint16_t)pool->base.res_cap->num_mpc_3dlut;
 	dc->caps.color.mpc.ogam_ram = 1;
 	dc->caps.color.mpc.ogam_rom_caps.srgb = 0;
 	dc->caps.color.mpc.ogam_rom_caps.bt2020 = 0;
@@ -1582,6 +1620,14 @@ static bool dcn301_resource_construct(
 		goto create_fail;
 	}
 
+	/* DIO */
+	pool->base.dio = dcn301_dio_create(ctx);
+	if (pool->base.dio == NULL) {
+		BREAK_TO_DEBUGGER();
+		dm_error("DC: failed to create dio!\n");
+		goto create_fail;
+	}
+
 	j = 0;
 	/* HUBPs, DPPs, OPPs and TGs */
 	for (i = 0; i < pool->base.pipe_count; i++) {
@@ -1632,13 +1678,13 @@ static bool dcn301_resource_construct(
 
 	/* ABM (or ABMs for NV2x) */
 	/* TODO: */
-	for (i = 0; i < pool->base.res_cap->num_timing_generator; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_timing_generator; i++) {
 		pool->base.multiple_abms[i] = dmub_abm_create(ctx,
 				&abm_regs[i],
 				&abm_shift,
 				&abm_mask);
 		if (pool->base.multiple_abms[i] == NULL) {
-			dm_error("DC: failed to create abm for pipe %d!\n", i);
+			dm_error("DC: failed to create abm for pipe %u!\n", i);
 			BREAK_TO_DEBUGGER();
 			goto create_fail;
 		}
@@ -1652,11 +1698,11 @@ static bool dcn301_resource_construct(
 		goto create_fail;
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_dsc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_dsc; i++) {
 		pool->base.dscs[i] = dcn301_dsc_create(ctx, i);
 		if (pool->base.dscs[i] == NULL) {
 			BREAK_TO_DEBUGGER();
-			dm_error("DC: failed to create display stream compressor %d!\n", i);
+			dm_error("DC: failed to create display stream compressor %u!\n", i);
 			goto create_fail;
 		}
 	}
@@ -1675,7 +1721,7 @@ static bool dcn301_resource_construct(
 	}
 
 	/* AUX and I2C */
-	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_ddc; i++) {
 		pool->base.engines[i] = dcn301_aux_engine_create(ctx, i);
 		if (pool->base.engines[i] == NULL) {
 			BREAK_TO_DEBUGGER();
@@ -1729,7 +1775,7 @@ struct resource_pool *dcn301_create_resource_pool(
 	if (!pool)
 		return NULL;
 
-	if (dcn301_resource_construct(init_data->num_virtual_links, dc, pool))
+	if (dcn301_resource_construct((uint8_t)init_data->num_virtual_links, dc, pool))
 		return &pool->base;
 
 	BREAK_TO_DEBUGGER();

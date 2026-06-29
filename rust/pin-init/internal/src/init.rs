@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote, quote_spanned};
+use quote::{format_ident, quote};
 use syn::{
     braced,
     parse::{End, Parse},
@@ -62,7 +62,6 @@ impl InitializerKind {
 
 enum InitializerAttribute {
     DefaultError(DefaultErrorAttribute),
-    DisableInitializedFieldAccess,
 }
 
 struct DefaultErrorAttribute {
@@ -86,6 +85,7 @@ pub(crate) fn expand(
     let error = error.map_or_else(
         || {
             if let Some(default_error) = attrs.iter().fold(None, |acc, attr| {
+                #[expect(irrefutable_let_patterns)]
                 if let InitializerAttribute::DefaultError(DefaultErrorAttribute { ty }) = attr {
                     Some(ty.clone())
                 } else {
@@ -103,17 +103,15 @@ pub(crate) fn expand(
         |(_, err)| Box::new(err),
     );
     let slot = format_ident!("slot");
-    let (has_data_trait, data_trait, get_data, init_from_closure) = if pinned {
+    let (has_data_trait, get_data, init_from_closure) = if pinned {
         (
             format_ident!("HasPinData"),
-            format_ident!("PinData"),
             format_ident!("__pin_data"),
             format_ident!("pin_init_from_closure"),
         )
     } else {
         (
             format_ident!("HasInitData"),
-            format_ident!("InitData"),
             format_ident!("__init_data"),
             format_ident!("init_from_closure"),
         )
@@ -145,22 +143,9 @@ pub(crate) fn expand(
     };
     // `mixed_site` ensures that the data is not accessible to the user-controlled code.
     let data = Ident::new("__data", Span::mixed_site());
-    let init_fields = init_fields(
-        &fields,
-        pinned,
-        !attrs
-            .iter()
-            .any(|attr| matches!(attr, InitializerAttribute::DisableInitializedFieldAccess)),
-        &data,
-        &slot,
-    );
+    let init_fields = init_fields(&fields, pinned, &data, &slot);
     let field_check = make_field_check(&fields, init_kind, &path);
     Ok(quote! {{
-        // We do not want to allow arbitrary returns, so we declare this type as the `Ok` return
-        // type and shadow it later when we insert the arbitrary user code. That way there will be
-        // no possibility of returning without `unsafe`.
-        struct __InitOk;
-
         // Get the data about fields from the supplied type.
         // SAFETY: TODO
         let #data = unsafe {
@@ -170,26 +155,21 @@ pub(crate) fn expand(
             #path::#get_data()
         };
         // Ensure that `#data` really is of type `#data` and help with type inference:
-        let init = ::pin_init::__internal::#data_trait::make_closure::<_, __InitOk, #error>(
-            #data,
+        let init = #data.__make_closure::<_, #error>(
             move |slot| {
-                {
-                    // Shadow the structure so it cannot be used to return early.
-                    struct __InitOk;
-                    #zeroable_check
-                    #this
-                    #init_fields
-                    #field_check
-                }
-                Ok(__InitOk)
+                #zeroable_check
+                #this
+                #init_fields
+                #field_check
+                // SAFETY: we are the `init!` macro that is allowed to call this.
+                Ok(unsafe { ::pin_init::__internal::InitOk::new() })
             }
         );
         let init = move |slot| -> ::core::result::Result<(), #error> {
             init(slot).map(|__InitOk| ())
         };
         // SAFETY: TODO
-        let init = unsafe { ::pin_init::#init_from_closure::<_, #error>(init) };
-        init
+        unsafe { ::pin_init::#init_from_closure::<_, #error>(init) }
     }})
 }
 
@@ -236,7 +216,6 @@ fn get_init_kind(rest: Option<(Token![..], Expr)>, dcx: &mut DiagCtxt) -> InitKi
 fn init_fields(
     fields: &Punctuated<InitializerField, Token![,]>,
     pinned: bool,
-    generate_initialized_accessors: bool,
     data: &Ident,
     slot: &Ident,
 ) -> TokenStream {
@@ -249,125 +228,82 @@ fn init_fields(
             cfgs.retain(|attr| attr.path().is_ident("cfg"));
             cfgs
         };
+
+        let ident = match kind {
+            InitializerKind::Value { ident, .. } => ident,
+            InitializerKind::Init { ident, .. } => ident,
+            InitializerKind::Code { block, .. } => {
+                res.extend(quote! {
+                    #(#attrs)*
+                    #[allow(unused_braces)]
+                    #block
+                });
+                continue;
+            }
+        };
+
+        let slot = if pinned {
+            quote! {
+                // SAFETY:
+                // - `slot` is valid and properly aligned.
+                // - `make_field_check` checks that `&raw mut (*slot).#ident` is properly aligned.
+                // - `make_field_check` prevents `#ident` from being used twice, therefore
+                //   `(*slot).#ident` is exclusively accessed and has not been initialized.
+                (unsafe { #data.#ident(#slot) })
+            }
+        } else {
+            quote! {
+                // For `init!()` macro, everything is unpinned.
+                // SAFETY:
+                // - `&raw mut (*slot).#ident` is valid.
+                // - `make_field_check` checks that `&raw mut (*slot).#ident` is properly aligned.
+                // - `make_field_check` prevents `#ident` from being used twice, therefore
+                //   `(*slot).#ident` is exclusively accessed and has not been initialized.
+                (unsafe {
+                    ::pin_init::__internal::Slot::<::pin_init::__internal::Unpinned, _>::new(
+                        &raw mut (*#slot).#ident
+                    )
+                })
+            }
+        };
+
+        // `mixed_site` ensures that the guard is not accessible to the user-controlled code.
+        let guard = format_ident!("__{ident}_guard", span = Span::mixed_site());
+
         let init = match kind {
             InitializerKind::Value { ident, value } => {
-                let mut value_ident = ident.clone();
-                let value_prep = value.as_ref().map(|value| &value.1).map(|value| {
-                    // Setting the span of `value_ident` to `value`'s span improves error messages
-                    // when the type of `value` is wrong.
-                    value_ident.set_span(value.span());
-                    quote!(let #value_ident = #value;)
-                });
-                // Again span for better diagnostics
-                let write = quote_spanned!(ident.span()=> ::core::ptr::write);
-                let accessor = if pinned {
-                    let project_ident = format_ident!("__project_{ident}");
-                    quote! {
-                        // SAFETY: TODO
-                        unsafe { #data.#project_ident(&mut (*#slot).#ident) }
-                    }
-                } else {
-                    quote! {
-                        // SAFETY: TODO
-                        unsafe { &mut (*#slot).#ident }
-                    }
-                };
-                let accessor = generate_initialized_accessors.then(|| {
-                    quote! {
-                        #(#cfgs)*
-                        #[allow(unused_variables)]
-                        let #ident = #accessor;
-                    }
-                });
+                let value = value
+                    .as_ref()
+                    .map(|(_, value)| quote!(#value))
+                    .unwrap_or_else(|| quote!(#ident));
+
                 quote! {
                     #(#attrs)*
-                    {
-                        #value_prep
-                        // SAFETY: TODO
-                        unsafe { #write(::core::ptr::addr_of_mut!((*#slot).#ident), #value_ident) };
-                    }
-                    #accessor
+                    let mut #guard = #slot.write(#value);
+
                 }
             }
-            InitializerKind::Init { ident, value, .. } => {
-                // Again span for better diagnostics
-                let init = format_ident!("init", span = value.span());
-                let (value_init, accessor) = if pinned {
-                    let project_ident = format_ident!("__project_{ident}");
-                    (
-                        quote! {
-                            // SAFETY:
-                            // - `slot` is valid, because we are inside of an initializer closure, we
-                            //   return when an error/panic occurs.
-                            // - We also use `#data` to require the correct trait (`Init` or `PinInit`)
-                            //   for `#ident`.
-                            unsafe { #data.#ident(::core::ptr::addr_of_mut!((*#slot).#ident), #init)? };
-                        },
-                        quote! {
-                            // SAFETY: TODO
-                            unsafe { #data.#project_ident(&mut (*#slot).#ident) }
-                        },
-                    )
-                } else {
-                    (
-                        quote! {
-                            // SAFETY: `slot` is valid, because we are inside of an initializer
-                            // closure, we return when an error/panic occurs.
-                            unsafe {
-                                ::pin_init::Init::__init(
-                                    #init,
-                                    ::core::ptr::addr_of_mut!((*#slot).#ident),
-                                )?
-                            };
-                        },
-                        quote! {
-                            // SAFETY: TODO
-                            unsafe { &mut (*#slot).#ident }
-                        },
-                    )
-                };
-                let accessor = generate_initialized_accessors.then(|| {
-                    quote! {
-                        #(#cfgs)*
-                        #[allow(unused_variables)]
-                        let #ident = #accessor;
-                    }
-                });
+            InitializerKind::Init { value, .. } => {
                 quote! {
                     #(#attrs)*
-                    {
-                        let #init = #value;
-                        #value_init
-                    }
-                    #accessor
+                    let mut #guard = #slot.init(#value)?;
                 }
             }
-            InitializerKind::Code { block: value, .. } => quote! {
-                #(#attrs)*
-                #[allow(unused_braces)]
-                #value
-            },
+            InitializerKind::Code { .. } => unreachable!(),
         };
-        res.extend(init);
-        if let Some(ident) = kind.ident() {
-            // `mixed_site` ensures that the guard is not accessible to the user-controlled code.
-            let guard = format_ident!("__{ident}_guard", span = Span::mixed_site());
-            res.extend(quote! {
-                #(#cfgs)*
-                // Create the drop guard:
-                //
-                // We rely on macro hygiene to make it impossible for users to access this local
-                // variable.
-                // SAFETY: We forget the guard later when initialization has succeeded.
-                let #guard = unsafe {
-                    ::pin_init::__internal::DropGuard::new(
-                        ::core::ptr::addr_of_mut!((*slot).#ident)
-                    )
-                };
-            });
-            guards.push(guard);
-            guard_attrs.push(cfgs);
-        }
+
+        res.extend(quote! {
+            #init
+
+            #(#cfgs)*
+            // Allow `non_snake_case` since the same warning is going to be reported for the struct
+            // field.
+            #[allow(unused_variables, non_snake_case)]
+            let #ident = #guard.let_binding();
+        });
+
+        guards.push(guard);
+        guard_attrs.push(cfgs);
     }
     quote! {
         #res
@@ -380,49 +316,49 @@ fn init_fields(
     }
 }
 
-/// Generate the check for ensuring that every field has been initialized.
+/// Generate the check for ensuring that every field has been initialized and aligned.
 fn make_field_check(
     fields: &Punctuated<InitializerField, Token![,]>,
     init_kind: InitKind,
     path: &Path,
 ) -> TokenStream {
-    let field_attrs = fields
+    let field_attrs: Vec<_> = fields
         .iter()
-        .filter_map(|f| f.kind.ident().map(|_| &f.attrs));
-    let field_name = fields.iter().filter_map(|f| f.kind.ident());
-    match init_kind {
-        InitKind::Normal => quote! {
-            // We use unreachable code to ensure that all fields have been mentioned exactly once,
-            // this struct initializer will still be type-checked and complain with a very natural
-            // error message if a field is forgotten/mentioned more than once.
-            #[allow(unreachable_code, clippy::diverging_sub_expression)]
-            // SAFETY: this code is never executed.
-            let _ = || unsafe {
-                ::core::ptr::write(slot, #path {
-                    #(
-                        #(#field_attrs)*
-                        #field_name: ::core::panic!(),
-                    )*
-                })
-            };
-        },
-        InitKind::Zeroing => quote! {
-            // We use unreachable code to ensure that all fields have been mentioned at most once.
-            // Since the user specified `..Zeroable::zeroed()` at the end, all missing fields will
-            // be zeroed. This struct initializer will still be type-checked and complain with a
-            // very natural error message if a field is mentioned more than once, or doesn't exist.
-            #[allow(unreachable_code, clippy::diverging_sub_expression, unused_assignments)]
-            // SAFETY: this code is never executed.
-            let _ = || unsafe {
-                ::core::ptr::write(slot, #path {
-                    #(
-                        #(#field_attrs)*
-                        #field_name: ::core::panic!(),
-                    )*
-                    ..::core::mem::zeroed()
-                })
-            };
-        },
+        .filter_map(|f| f.kind.ident().map(|_| &f.attrs))
+        .collect();
+    let field_name: Vec<_> = fields.iter().filter_map(|f| f.kind.ident()).collect();
+    let zeroing_trailer = match init_kind {
+        InitKind::Normal => None,
+        InitKind::Zeroing => Some(quote! {
+            ..::core::mem::zeroed()
+        }),
+    };
+    quote! {
+        #[allow(unreachable_code, clippy::diverging_sub_expression)]
+        // We use unreachable code to perform field checks. They're still checked by the compiler.
+        // SAFETY: this code is never executed.
+        let _ = || unsafe {
+            // Create references to ensure that the initialized field is properly aligned.
+            // Unaligned fields will cause the compiler to emit E0793. We do not support
+            // unaligned fields since `Init::__init` requires an aligned pointer; the call to
+            // `ptr::write` for value-initialization case has the same requirement.
+            #(
+                #(#field_attrs)*
+                let _ = &(*slot).#field_name;
+            )*
+
+            // If the zeroing trailer is not present, this checks that all fields have been
+            // mentioned exactly once. If the zeroing trailer is present, all missing fields will be
+            // zeroed, so this checks that all fields have been mentioned at most once. The use of
+            // struct initializer will still generate very natural error messages for any misuse.
+            ::core::ptr::write(slot, #path {
+                #(
+                    #(#field_attrs)*
+                    #field_name: loop {},
+                )*
+                #zeroing_trailer
+            })
+        };
     }
 }
 
@@ -466,10 +402,6 @@ impl Parse for Initializer {
                 if a.path().is_ident("default_error") {
                     a.parse_args::<DefaultErrorAttribute>()
                         .map(InitializerAttribute::DefaultError)
-                } else if a.path().is_ident("disable_initialized_field_access") {
-                    a.meta
-                        .require_path_only()
-                        .map(|_| InitializerAttribute::DisableInitializedFieldAccess)
                 } else {
                     Err(syn::Error::new_spanned(a, "unknown initializer attribute"))
                 }

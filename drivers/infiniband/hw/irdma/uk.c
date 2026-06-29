@@ -1438,7 +1438,7 @@ exit:
  * irdma_round_up_wq - return round up qp wq depth
  * @wqdepth: wq depth in quanta to round up
  */
-static int irdma_round_up_wq(u32 wqdepth)
+static u64 irdma_round_up_wq(u64 wqdepth)
 {
 	int scount = 1;
 
@@ -1491,15 +1491,16 @@ void irdma_get_wqe_shift(struct irdma_uk_attrs *uk_attrs, u32 sge,
 int irdma_get_sqdepth(struct irdma_uk_attrs *uk_attrs, u32 sq_size, u8 shift,
 		      u32 *sqdepth)
 {
-	u32 min_size = (u32)uk_attrs->min_hw_wq_size << shift;
+	u32 min_hw_quanta = (u32)uk_attrs->min_hw_wq_size << shift;
+	u64 hw_quanta =
+		irdma_round_up_wq(((u64)sq_size << shift) + IRDMA_SQ_RSVD);
 
-	*sqdepth = irdma_round_up_wq((sq_size << shift) + IRDMA_SQ_RSVD);
-
-	if (*sqdepth < min_size)
-		*sqdepth = min_size;
-	else if (*sqdepth > uk_attrs->max_hw_wq_quanta)
+	if (hw_quanta < min_hw_quanta)
+		hw_quanta = min_hw_quanta;
+	else if (hw_quanta > uk_attrs->max_hw_wq_quanta)
 		return -EINVAL;
 
+	*sqdepth = hw_quanta;
 	return 0;
 }
 
@@ -1513,15 +1514,16 @@ int irdma_get_sqdepth(struct irdma_uk_attrs *uk_attrs, u32 sq_size, u8 shift,
 int irdma_get_rqdepth(struct irdma_uk_attrs *uk_attrs, u32 rq_size, u8 shift,
 		      u32 *rqdepth)
 {
-	u32 min_size = (u32)uk_attrs->min_hw_wq_size << shift;
+	u32 min_hw_quanta = (u32)uk_attrs->min_hw_wq_size << shift;
+	u64 hw_quanta =
+		irdma_round_up_wq(((u64)rq_size << shift) + IRDMA_RQ_RSVD);
 
-	*rqdepth = irdma_round_up_wq((rq_size << shift) + IRDMA_RQ_RSVD);
-
-	if (*rqdepth < min_size)
-		*rqdepth = min_size;
-	else if (*rqdepth > uk_attrs->max_hw_rq_quanta)
+	if (hw_quanta < min_hw_quanta)
+		hw_quanta = min_hw_quanta;
+	else if (hw_quanta > uk_attrs->max_hw_rq_quanta)
 		return -EINVAL;
 
+	*rqdepth = hw_quanta;
 	return 0;
 }
 
@@ -1535,13 +1537,16 @@ int irdma_get_rqdepth(struct irdma_uk_attrs *uk_attrs, u32 rq_size, u8 shift,
 int irdma_get_srqdepth(struct irdma_uk_attrs *uk_attrs, u32 srq_size, u8 shift,
 		       u32 *srqdepth)
 {
-	*srqdepth = irdma_round_up_wq((srq_size << shift) + IRDMA_RQ_RSVD);
+	u32 min_hw_quanta = (u32)uk_attrs->min_hw_wq_size << shift;
+	u64 hw_quanta =
+		irdma_round_up_wq(((u64)srq_size << shift) + IRDMA_RQ_RSVD);
 
-	if (*srqdepth < ((u32)uk_attrs->min_hw_wq_size << shift))
-		*srqdepth = uk_attrs->min_hw_wq_size << shift;
-	else if (*srqdepth > uk_attrs->max_hw_srq_quanta)
+	if (hw_quanta < min_hw_quanta)
+		hw_quanta = min_hw_quanta;
+	else if (hw_quanta > uk_attrs->max_hw_srq_quanta)
 		return -EINVAL;
 
+	*srqdepth = hw_quanta;
 	return 0;
 }
 
@@ -1563,15 +1568,12 @@ static const struct irdma_wqe_uk_ops iw_wqe_uk_ops_gen_1 = {
  * irdma_setup_connection_wqes - setup WQEs necessary to complete
  * connection.
  * @qp: hw qp (user and kernel)
- * @info: qp initialization info
  */
-static void irdma_setup_connection_wqes(struct irdma_qp_uk *qp,
-					struct irdma_qp_uk_init_info *info)
+static void irdma_setup_connection_wqes(struct irdma_qp_uk *qp)
 {
 	u16 move_cnt = 1;
 
-	if (!info->legacy_mode &&
-	    (qp->uk_attrs->feature_flags & IRDMA_FEATURE_RTS_AE))
+	if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_RTS_AE)
 		move_cnt = 3;
 
 	qp->conn_wqes = move_cnt;
@@ -1722,7 +1724,7 @@ int irdma_uk_qp_init(struct irdma_qp_uk *qp, struct irdma_qp_uk_init_info *info)
 	sq_ring_size = qp->sq_size << info->sq_shift;
 	IRDMA_RING_INIT(qp->sq_ring, sq_ring_size);
 	if (info->first_sq_wq) {
-		irdma_setup_connection_wqes(qp, info);
+		irdma_setup_connection_wqes(qp);
 		qp->swqe_polarity = 1;
 		qp->first_sq_wq = true;
 	} else {

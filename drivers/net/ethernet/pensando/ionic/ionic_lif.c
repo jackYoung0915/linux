@@ -140,6 +140,7 @@ void ionic_lif_deferred_enqueue(struct ionic_lif *lif,
 
 static void ionic_link_status_check(struct ionic_lif *lif)
 {
+	struct ionic_dev *idev = &lif->ionic->idev;
 	struct net_device *netdev = lif->netdev;
 	u16 link_status;
 	bool link_up;
@@ -152,6 +153,8 @@ static void ionic_link_status_check(struct ionic_lif *lif)
 		clear_bit(IONIC_LIF_F_LINK_CHECK_REQUESTED, lif->state);
 		return;
 	}
+
+	ionic_reset_link_down_count(idev);
 
 	link_status = le16_to_cpu(lif->info->status.link_status);
 	link_up = link_status == IONIC_PORT_OPER_STATUS_UP;
@@ -179,7 +182,6 @@ static void ionic_link_status_check(struct ionic_lif *lif)
 		}
 	} else {
 		if (netif_carrier_ok(netdev)) {
-			lif->link_down_count++;
 			netdev_info(netdev, "Link down\n");
 			netif_carrier_off(netdev);
 		}
@@ -1719,13 +1721,18 @@ static int ionic_set_mac_address(struct net_device *netdev, void *sa)
 	if (ether_addr_equal(netdev->dev_addr, mac))
 		return 0;
 
-	err = ionic_program_mac(lif, mac);
-	if (err < 0)
-		return err;
+	/* Only program macs for virtual functions to avoid losing the permanent
+	 * Mac across warm reset/reboot.
+	 */
+	if (lif->ionic->pdev->is_virtfn) {
+		err = ionic_program_mac(lif, mac);
+		if (err < 0)
+			return err;
 
-	if (err > 0)
-		netdev_dbg(netdev, "%s: SET and GET ATTR Mac are not equal-due to old FW running\n",
-			   __func__);
+		if (err > 0)
+			netdev_dbg(netdev, "%s: SET and GET ATTR Mac are not equal-due to old FW running\n",
+				   __func__);
+	}
 
 	err = eth_prepare_mac_addr_change(netdev, addr);
 	if (err)

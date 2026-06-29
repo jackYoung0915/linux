@@ -723,6 +723,21 @@ static const struct pinconf_ops pmic_gpio_pinconf_ops = {
 	.pin_config_group_dbg_show	= pmic_gpio_config_dbg_show,
 };
 
+static int pmic_gpio_get_direction(struct gpio_chip *chip, unsigned pin)
+{
+	struct pmic_gpio_state *state = gpiochip_get_data(chip);
+	struct pmic_gpio_pad *pad;
+
+	pad = state->ctrl->desc->pins[pin].drv_data;
+
+	if (!pad->is_enabled || pad->analog_pass ||
+	    (!pad->input_enabled && !pad->output_enabled))
+		return -EINVAL;
+
+	/* Make sure the state is aligned on what pmic_gpio_get() returns */
+	return pad->input_enabled ? GPIO_LINE_DIRECTION_IN : GPIO_LINE_DIRECTION_OUT;
+}
+
 static int pmic_gpio_direction_input(struct gpio_chip *chip, unsigned pin)
 {
 	struct pmic_gpio_state *state = gpiochip_get_data(chip);
@@ -801,6 +816,7 @@ static void pmic_gpio_dbg_show(struct seq_file *s, struct gpio_chip *chip)
 }
 
 static const struct gpio_chip pmic_gpio_gpio_template = {
+	.get_direction		= pmic_gpio_get_direction,
 	.direction_input	= pmic_gpio_direction_input,
 	.direction_output	= pmic_gpio_direction_output,
 	.get			= pmic_gpio_get,
@@ -1213,6 +1229,7 @@ static const struct of_device_id pmic_gpio_of_match[] = {
 	{ .compatible = "qcom,pm7550-gpio", .data = (void *) 12 },
 	{ .compatible = "qcom,pm7550ba-gpio", .data = (void *) 8},
 	{ .compatible = "qcom,pm8005-gpio", .data = (void *) 4 },
+	{ .compatible = "qcom,pm8010-gpio", .data = (void *) 2 },
 	{ .compatible = "qcom,pm8019-gpio", .data = (void *) 6 },
 	/* pm8150 has 10 GPIOs with holes on 2, 5, 7 and 8 */
 	{ .compatible = "qcom,pm8150-gpio", .data = (void *) 10 },

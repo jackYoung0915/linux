@@ -213,7 +213,7 @@ static irqreturn_t pvr_device_irq_thread_handler(int irq, void *data)
 	while (pvr_fw_irq_pending(pvr_dev)) {
 		pvr_fw_irq_clear(pvr_dev);
 
-		if (pvr_dev->fw_dev.booted) {
+		if (READ_ONCE(pvr_dev->fw_dev.initialised)) {
 			pvr_fwccb_process(pvr_dev);
 			pvr_kccb_wake_up_waiters(pvr_dev);
 			pvr_device_process_active_queues(pvr_dev);
@@ -225,29 +225,12 @@ static irqreturn_t pvr_device_irq_thread_handler(int irq, void *data)
 	}
 
 	if (pvr_dev->has_safety_events) {
-		int err;
-
-		/*
-		 * Ensure the GPU is powered on since some safety events (such
-		 * as ECC faults) can happen outside of job submissions, which
-		 * are otherwise the only time a power reference is held.
-		 */
-		err = pvr_power_get(pvr_dev);
-		if (err) {
-			drm_err_ratelimited(drm_dev,
-					    "%s: could not take power reference (%d)\n",
-					    __func__, err);
-			return ret;
-		}
-
 		while (pvr_device_safety_irq_pending(pvr_dev)) {
 			pvr_device_safety_irq_clear(pvr_dev);
 			pvr_device_handle_safety_events(pvr_dev);
 
 			ret = IRQ_HANDLED;
 		}
-
-		pvr_power_put(pvr_dev);
 	}
 
 	return ret;
